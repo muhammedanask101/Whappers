@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from app.db.database import init_db
+from app.db.mongo import get_mongo_database
 from app.routes.whatsapp import router as whatsapp_router
 
 
@@ -35,7 +36,11 @@ app = FastAPI(
 app.include_router(whatsapp_router)
 
 
+@app.on_event("startup")
+def startup_checks() -> None:
+    get_mongo_database()
+
+
 @app.get("/health")
 def healthcheck() -> dict:
     return {"status": "ok"}
-

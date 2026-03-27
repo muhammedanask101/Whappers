@@ -1,27 +1,20 @@
-import json
-from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-from app.db.database import execute, fetch_one
+from app.db.mongo import get_collection, utc_now
 
 
 def get_conversation_state(phone: str) -> Dict[str, Any]:
-    row = fetch_one("SELECT * FROM conversation_state WHERE phone = ?", (phone,))
-    if not row:
+    collection = get_collection("conversation_state")
+    document = collection.find_one({"phone": phone})
+    if not document:
         return {"phone": phone, "pendingAction": None, "lastLanguage": "english"}
 
-    pending_action = None
-    if row["pending_type"]:
-        pending_action = {
-            "type": row["pending_type"],
-            "data": json.loads(row["pending_data"] or "{}"),
-        }
     return {
-        "phone": row["phone"],
-        "role": row["role"],
-        "pendingAction": pending_action,
-        "lastLanguage": row["last_language"] or "english",
-        "lastMessage": row["last_message"],
+        "phone": document["phone"],
+        "role": document.get("role"),
+        "pendingAction": document.get("pending_action"),
+        "lastLanguage": document.get("last_language") or "english",
+        "lastMessage": document.get("last_message"),
     }
 
 
@@ -34,45 +27,59 @@ def set_pending_action(
     last_language: str,
     last_message: str,
 ) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    execute(
-        """
-        INSERT INTO conversation_state (phone, role, pending_type, pending_data, last_language, last_message, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(phone) DO UPDATE SET
-            role = excluded.role,
-            pending_type = excluded.pending_type,
-            pending_data = excluded.pending_data,
-            last_language = excluded.last_language,
-            last_message = excluded.last_message,
-            updated_at = excluded.updated_at
-        """,
-        (phone, role, action_type, json.dumps(data), last_language, last_message, now),
+    get_collection("conversation_state").update_one(
+        {"phone": phone},
+        {
+            "$set": {
+                "phone": phone,
+                "role": role,
+                "pending_action": {"type": action_type, "data": data},
+                "last_language": last_language,
+                "last_message": last_message,
+                "updated_at": utc_now(),
+            }
+        },
+        upsert=True,
     )
 
 
 def clear_pending_action(phone: str) -> None:
-    execute(
-        """
-        UPDATE conversation_state
-        SET pending_type = NULL, pending_data = NULL, updated_at = ?
-        WHERE phone = ?
-        """,
-        (datetime.now(timezone.utc).isoformat(), phone),
+    get_collection("conversation_state").update_one(
+        {"phone": phone},
+        {"$set": {"pending_action": None, "updated_at": utc_now()}},
+        upsert=True,
     )
 
 
 def update_last_language(phone: str, role: str, language: str, last_message: str) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    execute(
-        """
-        INSERT INTO conversation_state (phone, role, last_language, last_message, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(phone) DO UPDATE SET
-            role = excluded.role,
-            last_language = excluded.last_language,
-            last_message = excluded.last_message,
-            updated_at = excluded.updated_at
-        """,
-        (phone, role, language, last_message, now),
+    get_collection("conversation_state").update_one(
+        {"phone": phone},
+        {
+            "$set": {
+                "phone": phone,
+                "role": role,
+                "last_language": language,
+                "last_message": last_message,
+                "updated_at": utc_now(),
+            }
+        },
+        upsert=True,
     )
+
+
+def append_history(phone: str, role: str, content: str) -> None:
+    get_collection("chat_history").insert_one(
+        {
+            "phone": phone,
+            "role": role,
+            "content": content,
+            "created_at": utc_now(),
+        }
+    )
+
+
+def get_recent_history(phone: str, limit: int = 10) -> List[Dict[str, str]]:
+    cursor = get_collection("chat_history").find({"phone": phone}).sort("created_at", -1).limit(limit)
+    items = list(cursor)
+    items.reverse()
+    return [{"role": item.get("role", "user"), "content": item.get("content", "")} for item in items]
