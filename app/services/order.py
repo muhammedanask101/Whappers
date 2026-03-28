@@ -3,16 +3,17 @@ from typing import Any, Dict, List, Optional
 
 from pymongo import ReturnDocument
 
-from app.db.mongo import get_collection, utc_now
+from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 from app.models.order import OrderItem, OrderRecord
 from app.services.vendor import get_pricing_adjustments, get_product_catalog_map, normalize_product_name
 
 
-def create_order(customer_phone: str, items: List[Dict[str, Any]], address: str) -> OrderRecord:
-    pricing = calculate_order_pricing(items)
+def create_order(business_id: str, customer_phone: str, items: List[Dict[str, Any]], address: str) -> OrderRecord:
+    pricing = calculate_order_pricing(items, business_id=business_id)
     now = utc_now()
     order = OrderRecord(
         orderId=f"ORD-{uuid.uuid4().hex[:8].upper()}",
+        businessId=business_id,
         customerPhone=customer_phone,
         items=[OrderItem(name=item["name"], qty=item["qty"]) for item in pricing["items"]],
         total=round(pricing["total"], 2),
@@ -22,6 +23,7 @@ def create_order(customer_phone: str, items: List[Dict[str, Any]], address: str)
     )
     get_collection("orders").insert_one(
         {
+            "business_id": business_id,
             "order_id": order.orderId,
             "customer_phone": order.customerPhone,
             "items": [item.model_dump() for item in order.items],
@@ -36,34 +38,37 @@ def create_order(customer_phone: str, items: List[Dict[str, Any]], address: str)
     return order
 
 
-def update_order_status(order_id: str, status: str) -> Optional[OrderRecord]:
+def update_order_status(order_id: str, status: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[OrderRecord]:
     document = get_collection("orders").find_one_and_update(
-        {"order_id": order_id},
+        {"business_id": business_id, "order_id": order_id},
         {"$set": {"status": status, "updated_at": utc_now()}},
         return_document=ReturnDocument.AFTER,
     )
     return _doc_to_order(document) if document else None
 
 
-def get_order_by_id(order_id: str) -> Optional[OrderRecord]:
-    document = get_collection("orders").find_one({"order_id": order_id})
+def get_order_by_id(order_id: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[OrderRecord]:
+    document = get_collection("orders").find_one({"business_id": business_id, "order_id": order_id})
     return _doc_to_order(document) if document else None
 
 
-def get_latest_order(customer_phone: str) -> Optional[OrderRecord]:
-    document = get_collection("orders").find_one({"customer_phone": customer_phone}, sort=[("created_at", -1)])
+def get_latest_order(customer_phone: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[OrderRecord]:
+    document = get_collection("orders").find_one(
+        {"business_id": business_id, "customer_phone": customer_phone},
+        sort=[("created_at", -1)],
+    )
     return _doc_to_order(document) if document else None
 
 
 def get_latest_vendor_actionable_order(
     target_order_id: Optional[str] = None,
     desired_status: Optional[str] = None,
+    business_id: str = DEFAULT_BUSINESS_ID,
 ) -> Optional[OrderRecord]:
-    collection = get_collection("orders")
     if target_order_id:
-        return get_order_by_id(target_order_id)
+        return get_order_by_id(target_order_id, business_id=business_id)
 
-    status_filter: Dict[str, Any] = {}
+    status_filter: Dict[str, Any] = {"business_id": business_id}
     if desired_status in {"accepted", "rejected"}:
         status_filter["status"] = "pending"
     elif desired_status == "out_for_delivery":
@@ -71,13 +76,13 @@ def get_latest_vendor_actionable_order(
     elif desired_status == "delivered":
         status_filter["status"] = "out_for_delivery"
 
-    document = collection.find_one(status_filter, sort=[("created_at", -1)])
+    document = get_collection("orders").find_one(status_filter, sort=[("created_at", -1)])
     return _doc_to_order(document) if document else None
 
 
-def calculate_order_pricing(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    catalog = get_product_catalog_map()
-    adjustments = get_pricing_adjustments()
+def calculate_order_pricing(items: List[Dict[str, Any]], business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
+    catalog = get_product_catalog_map(business_id=business_id)
+    adjustments = get_pricing_adjustments(business_id=business_id)
     normalized_items: List[Dict[str, Any]] = []
     line_items: List[Dict[str, Any]] = []
     total = 0.0
@@ -117,7 +122,6 @@ def choose_best_adjustment(product: Dict[str, Any], unit_price: float, adjustmen
     for adjustment in adjustments:
         if not adjustment_applies(product, adjustment):
             continue
-
         discount_type = adjustment.get("discount_type")
         discount_value = float(adjustment.get("discount_value") or 0)
         discounted = unit_price
@@ -143,8 +147,8 @@ def adjustment_applies(product: Dict[str, Any], adjustment: Dict[str, Any]) -> b
     return False
 
 
-def build_order_preview(items: List[Dict[str, Any]], address: str, style: str = "english") -> Dict[str, str]:
-    pricing = calculate_order_pricing(items)
+def build_order_preview(items: List[Dict[str, Any]], address: str, style: str = "english", business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, str]:
+    pricing = calculate_order_pricing(items, business_id=business_id)
     price_lines = []
     for line in pricing["line_items"]:
         detail = f"- {line['display_name']} x {line['qty']} = Rs {line['line_total']:.2f}"
@@ -174,6 +178,7 @@ def format_order_summary(items: List[OrderItem]) -> str:
 def _doc_to_order(document: Dict[str, Any]) -> OrderRecord:
     return OrderRecord(
         orderId=document["order_id"],
+        businessId=document.get("business_id", DEFAULT_BUSINESS_ID),
         customerPhone=document["customer_phone"],
         items=[OrderItem(**item) for item in document.get("items", [])],
         total=float(document["total"]),

@@ -9,51 +9,48 @@ from typing import Any, Dict, List, Optional
 
 from pymongo import ReturnDocument
 
-from app.db.mongo import generate_id, get_collection, parse_datetime, to_iso, utc_now
+from app.db.mongo import DEFAULT_BUSINESS_ID, generate_id, get_collection, parse_datetime, slugify, to_iso, utc_now
 from app.models.order import OrderRecord
 
 
 def normalize_phone(phone: str) -> str:
     phone = phone.strip()
+    if not phone:
+        return ""
     if phone.startswith("whatsapp:"):
         return phone
     if phone.startswith("+"):
         return f"whatsapp:{phone}"
     digits = re.sub(r"[^\d+]", "", phone)
+    if not digits:
+        return ""
     if not digits.startswith("+"):
         digits = f"+{digits}"
     return f"whatsapp:{digits}"
 
 
-def send_whatsapp_message(to: str, body: str) -> Dict[str, Any]:
+def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None) -> Dict[str, Any]:
+    normalized_to = normalize_phone(to)
+    normalized_from = normalize_phone(from_number or os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip())
     if os.getenv("DEBUG", "").strip().lower() == "true":
         print("=== DEBUG WHATSAPP MESSAGE ===")
-        print(f"TO: {normalize_phone(to)}")
+        print(f"FROM: {normalized_from}")
+        print(f"TO: {normalized_to}")
         print(body)
         print("==============================")
         return {"ok": True, "debug": True}
 
     account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
     auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-    from_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip()
-    if not all([account_sid, auth_token, from_number]):
+    if not all([account_sid, auth_token, normalized_from]):
         raise RuntimeError("Twilio WhatsApp environment variables are not fully configured.")
 
-    payload = urllib.parse.urlencode(
-        {
-            "From": normalize_phone(from_number),
-            "To": normalize_phone(to),
-            "Body": body,
-        }
-    ).encode("utf-8")
+    payload = urllib.parse.urlencode({"From": normalized_from, "To": normalized_to, "Body": body}).encode("utf-8")
     credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
     request = urllib.request.Request(
         f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
         data=payload,
-        headers={
-            "Authorization": f"Basic {credentials}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
     try:
@@ -75,8 +72,187 @@ def normalize_product_name(name: str) -> str:
     return normalized
 
 
-def get_product_category(name: str) -> str:
-    product = get_product_details(name)
+def get_business_by_id(business_id: str) -> Optional[Dict[str, Any]]:
+    document = get_collection("businesses").find_one({"business_id": business_id})
+    return _serialize_business(document) if document else None
+
+
+def get_business_by_whatsapp_number(number: str) -> Optional[Dict[str, Any]]:
+    normalized = normalize_phone(number)
+    if not normalized:
+        return None
+    document = get_collection("businesses").find_one({"whatsapp_number": normalized, "active": True})
+    return _serialize_business(document) if document else None
+
+
+def get_business_by_vendor_phone(number: str) -> Optional[Dict[str, Any]]:
+    normalized = normalize_phone(number)
+    if not normalized:
+        return None
+    document = get_collection("businesses").find_one({"vendor_phone": normalized, "active": True})
+    return _serialize_business(document) if document else None
+
+
+def list_businesses(active_only: bool = False) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {}
+    if active_only:
+        query["active"] = True
+    return [_serialize_business(doc) for doc in get_collection("businesses").find(query).sort("created_at", 1)]
+
+
+def create_business(
+    *,
+    name: str,
+    slug: Optional[str] = None,
+    whatsapp_number: str,
+    vendor_phone: str,
+    business_type: str = "retail",
+    description: str = "",
+    address: str = "",
+    hours: str = "",
+    contact_phone: str = "",
+    support_details: str = "",
+    policies: str = "",
+    delivery_info: str = "",
+) -> Dict[str, Any]:
+    now = utc_now()
+    normalized_whatsapp = normalize_phone(whatsapp_number)
+    normalized_vendor = normalize_phone(vendor_phone)
+    normalized_contact = normalize_phone(contact_phone) if contact_phone.strip() else normalized_vendor
+    normalized_slug = slugify(slug or name)
+
+    reusable = _find_reusable_business(normalized_vendor, normalized_whatsapp, normalized_slug)
+    if reusable:
+        document = get_collection("businesses").find_one_and_update(
+            {"_id": reusable["_id"]},
+            {
+                "$set": {
+                    "slug": normalized_slug,
+                    "name": name.strip(),
+                    "whatsapp_number": normalized_whatsapp,
+                    "vendor_phone": normalized_vendor,
+                    "business_type": business_type.strip().lower() or "retail",
+                    "description": description.strip(),
+                    "address": address.strip(),
+                    "hours": hours.strip(),
+                    "contact_phone": normalized_contact,
+                    "support_details": support_details.strip(),
+                    "policies": policies.strip(),
+                    "delivery_info": delivery_info.strip(),
+                    "active": True,
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return _serialize_business(document)
+
+    _release_inactive_business_conflicts(
+        vendor_phone=normalized_vendor,
+        whatsapp_number=normalized_whatsapp,
+        slug=normalized_slug,
+    )
+    _ensure_business_conflicts_clear(normalized_vendor, normalized_whatsapp, normalized_slug)
+    business_id = generate_id("biz")
+    document = {
+        "business_id": business_id,
+        "slug": normalized_slug,
+        "name": name.strip(),
+        "whatsapp_number": normalized_whatsapp,
+        "vendor_phone": normalized_vendor,
+        "business_type": business_type.strip().lower() or "retail",
+        "description": description.strip(),
+        "address": address.strip(),
+        "hours": hours.strip(),
+        "contact_phone": normalized_contact,
+        "support_details": support_details.strip(),
+        "policies": policies.strip(),
+        "delivery_info": delivery_info.strip(),
+        "broadcast_groups": [],
+        "active": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    get_collection("businesses").insert_one(document)
+    return _serialize_business(document)
+
+
+def update_business(
+    business_id: str,
+    *,
+    name: Optional[str] = None,
+    slug: Optional[str] = None,
+    whatsapp_number: Optional[str] = None,
+    vendor_phone: Optional[str] = None,
+    business_type: Optional[str] = None,
+    description: Optional[str] = None,
+    address: Optional[str] = None,
+    hours: Optional[str] = None,
+    contact_phone: Optional[str] = None,
+    support_details: Optional[str] = None,
+    policies: Optional[str] = None,
+    delivery_info: Optional[str] = None,
+    active: Optional[bool] = None,
+) -> Optional[Dict[str, Any]]:
+    current = get_collection("businesses").find_one({"business_id": business_id})
+    if not current:
+        return None
+
+    update_fields: Dict[str, Any] = {"updated_at": utc_now()}
+    if name is not None:
+        update_fields["name"] = name.strip()
+    if slug is not None:
+        update_fields["slug"] = slugify(slug)
+    if whatsapp_number is not None:
+        update_fields["whatsapp_number"] = normalize_phone(whatsapp_number)
+    if vendor_phone is not None:
+        update_fields["vendor_phone"] = normalize_phone(vendor_phone)
+    if business_type is not None:
+        update_fields["business_type"] = business_type.strip().lower() or "retail"
+    if description is not None:
+        update_fields["description"] = description.strip()
+    if address is not None:
+        update_fields["address"] = address.strip()
+    if hours is not None:
+        update_fields["hours"] = hours.strip()
+    if contact_phone is not None:
+        update_fields["contact_phone"] = normalize_phone(contact_phone) if contact_phone.strip() else ""
+    if support_details is not None:
+        update_fields["support_details"] = support_details.strip()
+    if policies is not None:
+        update_fields["policies"] = policies.strip()
+    if delivery_info is not None:
+        update_fields["delivery_info"] = delivery_info.strip()
+    if active is not None:
+        update_fields["active"] = bool(active)
+
+    target_slug = str(update_fields.get("slug") or current.get("slug") or "").strip()
+    target_vendor = str(update_fields.get("vendor_phone") or current.get("vendor_phone") or "").strip()
+    target_whatsapp = str(update_fields.get("whatsapp_number") or current.get("whatsapp_number") or "").strip()
+
+    _release_inactive_business_conflicts(
+        current_business_id=business_id,
+        vendor_phone=target_vendor,
+        whatsapp_number=target_whatsapp,
+        slug=target_slug,
+    )
+    _ensure_business_conflicts_clear(
+        target_vendor,
+        target_whatsapp,
+        target_slug,
+        exclude_business_id=business_id,
+    )
+
+    document = get_collection("businesses").find_one_and_update(
+        {"business_id": business_id},
+        {"$set": update_fields},
+        return_document=ReturnDocument.AFTER,
+    )
+    return _serialize_business(document) if document else None
+
+
+def get_product_category(name: str, business_id: str = DEFAULT_BUSINESS_ID) -> str:
+    product = get_product_details(name, business_id=business_id)
     if product:
         return product.get("category", "other")
     normalized = normalize_product_name(name)
@@ -92,6 +268,8 @@ def get_product_category(name: str) -> str:
 
 
 def get_product_catalog(
+    *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     filter_category: Optional[str] = None,
     search: Optional[str] = None,
     min_price: Optional[float] = None,
@@ -101,8 +279,7 @@ def get_product_catalog(
     sort_order: str = "asc",
     limit: int = 10,
 ) -> List[Dict[str, Any]]:
-    collection = get_collection("products")
-    query: Dict[str, Any] = {"active": True}
+    query: Dict[str, Any] = {"business_id": business_id, "active": True}
     if filter_category:
         query["category"] = filter_category
     if search:
@@ -124,25 +301,23 @@ def get_product_catalog(
         if normalized_tags:
             query["tags"] = {"$in": normalized_tags}
 
-    products = []
     allowed_sort_fields = {"display_name", "price", "category", "updated_at"}
     mongo_sort_field = sort_by if sort_by in allowed_sort_fields else "display_name"
     mongo_sort_order = 1 if str(sort_order).lower() != "desc" else -1
-    safe_limit = min(max(int(limit or 10), 1), 20)
-    for doc in collection.find(query).sort(mongo_sort_field, mongo_sort_order).limit(safe_limit):
-        products.append(_serialize_product(doc))
-    return products
+    safe_limit = min(max(int(limit or 10), 1), 100)
+    cursor = get_collection("products").find(query).sort(mongo_sort_field, mongo_sort_order).limit(safe_limit)
+    return [_serialize_product(doc) for doc in cursor]
 
 
-def get_product_catalog_map() -> Dict[str, Dict[str, Any]]:
-    return {product["name"]: product for product in get_product_catalog()}
+def get_product_catalog_map(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Dict[str, Any]]:
+    return {product["name"]: product for product in get_product_catalog(business_id=business_id, limit=100)}
 
 
-def get_product_details(name: str) -> Optional[Dict[str, Any]]:
+def get_product_details(name: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[Dict[str, Any]]:
     normalized = normalize_product_name(name)
-    collection = get_collection("products")
-    document = collection.find_one(
+    document = get_collection("products").find_one(
         {
+            "business_id": business_id,
             "active": True,
             "$or": [
                 {"name": normalized},
@@ -154,12 +329,13 @@ def get_product_details(name: str) -> Optional[Dict[str, Any]]:
     return _serialize_product(document) if document else None
 
 
-def product_exists(name: str) -> bool:
-    return get_product_details(name) is not None
+def product_exists(name: str, business_id: str = DEFAULT_BUSINESS_ID) -> bool:
+    return get_product_details(name, business_id=business_id) is not None
 
 
 def add_product(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     name: str,
     price: float,
     unit: str,
@@ -171,26 +347,31 @@ def add_product(
     normalized = normalize_product_name(name)
     now = utc_now()
     document = {
+        "business_id": business_id,
         "name": normalized,
         "display_name": name.strip().title(),
         "price": float(price),
         "unit": unit.strip() or "unit",
-        "category": (category or get_product_category(normalized)).strip().lower(),
+        "category": (category or get_product_category(normalized, business_id)).strip().lower(),
         "description": description.strip(),
         "tags": [str(tag).strip().lower() for tag in (tags or []) if str(tag).strip()],
         "attributes": attributes or {},
         "active": True,
         "offer_price": None,
         "offer_until": None,
-        "created_at": now,
         "updated_at": now,
     }
-    get_collection("products").update_one({"name": normalized}, {"$set": document}, upsert=True)
-    return get_product_details(normalized) or _serialize_product(document)
+    get_collection("products").update_one(
+        {"business_id": business_id, "name": normalized},
+        {"$set": document, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return get_product_details(normalized, business_id=business_id) or _serialize_product(document)
 
 
 def update_product(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     name: str,
     price: Optional[float] = None,
     unit: Optional[str] = None,
@@ -218,67 +399,62 @@ def update_product(
         update_fields["active"] = bool(active)
 
     document = get_collection("products").find_one_and_update(
-        {"name": normalized},
+        {"business_id": business_id, "name": normalized},
         {"$set": update_fields},
         return_document=ReturnDocument.AFTER,
     )
     return _serialize_product(document) if document else None
 
 
-def delete_product(name: str) -> bool:
-    normalized = normalize_product_name(name)
+def delete_product(name: str, business_id: str = DEFAULT_BUSINESS_ID) -> bool:
     result = get_collection("products").update_one(
-        {"name": normalized},
+        {"business_id": business_id, "name": normalize_product_name(name)},
         {"$set": {"active": False, "updated_at": utc_now()}},
     )
     return result.matched_count > 0
 
 
-def update_product_offer(product: str, offer_price: float, offer_until: Optional[str]) -> Dict[str, Any]:
-    normalized = normalize_product_name(product)
+def update_product_offer(product: str, offer_price: float, offer_until: Optional[str], business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
     document = get_collection("products").find_one_and_update(
-        {"name": normalized},
-        {
-            "$set": {
-                "offer_price": float(offer_price),
-                "offer_until": parse_datetime(offer_until),
-                "updated_at": utc_now(),
-            }
-        },
+        {"business_id": business_id, "name": normalize_product_name(product)},
+        {"$set": {"offer_price": float(offer_price), "offer_until": parse_datetime(offer_until), "updated_at": utc_now()}},
         return_document=ReturnDocument.AFTER,
     )
     if not document:
-        raise RuntimeError(f"Product '{normalized}' not found.")
+        raise RuntimeError(f"Product '{product}' not found.")
     return _serialize_product(document)
 
 
-def clear_product_offer(product: str) -> bool:
-    normalized = normalize_product_name(product)
+def clear_product_offer(product: str, business_id: str = DEFAULT_BUSINESS_ID) -> bool:
     result = get_collection("products").update_one(
-        {"name": normalized},
+        {"business_id": business_id, "name": normalize_product_name(product)},
         {"$set": {"offer_price": None, "offer_until": None, "updated_at": utc_now()}},
     )
     return result.matched_count > 0
 
 
-def get_business_profile() -> Dict[str, Any]:
-    document = get_collection("business_profile").find_one({"profile_id": "default"}) or {}
-    return {
-        "name": document.get("name", "Local Shop"),
-        "business_type": document.get("business_type", "retail"),
-        "description": document.get("description", ""),
-        "address": document.get("address", ""),
-        "hours": document.get("hours", ""),
-        "contact_phone": document.get("contact_phone", ""),
-        "support_details": document.get("support_details", ""),
-        "policies": document.get("policies", ""),
-        "delivery_info": document.get("delivery_info", ""),
-        "broadcast_groups": document.get("broadcast_groups", []),
+def get_business_profile(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
+    return get_business_by_id(business_id) or get_business_by_id(DEFAULT_BUSINESS_ID) or {
+        "business_id": DEFAULT_BUSINESS_ID,
+        "name": "Local Shop",
+        "business_type": "retail",
+        "description": "",
+        "address": "",
+        "hours": "",
+        "contact_phone": "",
+        "vendor_phone": "",
+        "whatsapp_number": "",
+        "support_details": "",
+        "policies": "",
+        "delivery_info": "",
+        "broadcast_groups": [],
+        "active": True,
     }
 
 
 def update_business_profile(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     name: Optional[str] = None,
     business_type: Optional[str] = None,
     description: Optional[str] = None,
@@ -302,7 +478,7 @@ def update_business_profile(
     if hours is not None:
         update_fields["hours"] = hours.strip()
     if contact_phone is not None:
-        update_fields["contact_phone"] = contact_phone.strip()
+        update_fields["contact_phone"] = normalize_phone(contact_phone) if contact_phone.strip() else ""
     if support_details is not None:
         update_fields["support_details"] = support_details.strip()
     if policies is not None:
@@ -312,25 +488,20 @@ def update_business_profile(
     if broadcast_groups is not None:
         update_fields["broadcast_groups"] = [normalize_phone(item) for item in broadcast_groups if str(item).strip()]
 
-    get_collection("business_profile").update_one(
-        {"profile_id": "default"},
-        {
-            "$set": update_fields,
-            "$setOnInsert": {"profile_id": "default", "created_at": utc_now()},
-        },
-        upsert=True,
-    )
-    return get_business_profile()
+    get_collection("businesses").update_one({"business_id": business_id}, {"$set": update_fields}, upsert=False)
+    return get_business_profile(business_id)
 
 
 def create_support_ticket(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     customer_phone: str,
     issue: str,
     order_id: Optional[str] = None,
     preferred_contact: Optional[str] = None,
 ) -> Dict[str, Any]:
     document = {
+        "business_id": business_id,
         "ticket_id": generate_id("support"),
         "customer_phone": customer_phone,
         "order_id": order_id,
@@ -341,16 +512,13 @@ def create_support_ticket(
         "updated_at": utc_now(),
     }
     get_collection("support_tickets").insert_one(document)
-    _notify_vendor_support_ticket(document)
-    return {
-        "ticket_id": document["ticket_id"],
-        "issue": document["issue"],
-        "status": document["status"],
-    }
+    _notify_vendor_support_ticket(document, business_id=business_id)
+    return {"ticket_id": document["ticket_id"], "issue": document["issue"], "status": document["status"]}
 
 
 def create_promotion(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     title: str,
     scope: str,
     target: Optional[str],
@@ -361,6 +529,7 @@ def create_promotion(
     broadcast_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     document = {
+        "business_id": business_id,
         "promotion_id": generate_id("promo"),
         "title": title.strip(),
         "scope": scope,
@@ -380,6 +549,7 @@ def create_promotion(
 
 def create_event(
     *,
+    business_id: str = DEFAULT_BUSINESS_ID,
     title: str,
     description: str,
     starts_at: Optional[str],
@@ -391,6 +561,7 @@ def create_event(
     broadcast_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     document = {
+        "business_id": business_id,
         "event_id": generate_id("event"),
         "title": title.strip(),
         "description": description.strip(),
@@ -409,10 +580,10 @@ def create_event(
     return serialize_event(document)
 
 
-def get_active_promotions() -> List[Dict[str, Any]]:
+def get_active_promotions(business_id: str = DEFAULT_BUSINESS_ID) -> List[Dict[str, Any]]:
     current = utc_now()
     active: List[Dict[str, Any]] = []
-    for doc in get_collection("promotions").find({"active": True}):
+    for doc in get_collection("promotions").find({"business_id": business_id, "active": True}):
         starts_at = parse_datetime(doc.get("starts_at")) or current
         ends_at = parse_datetime(doc.get("ends_at"))
         if starts_at <= current and (ends_at is None or ends_at >= current):
@@ -420,10 +591,10 @@ def get_active_promotions() -> List[Dict[str, Any]]:
     return active
 
 
-def get_active_events() -> List[Dict[str, Any]]:
+def get_active_events(business_id: str = DEFAULT_BUSINESS_ID) -> List[Dict[str, Any]]:
     current = utc_now()
     active: List[Dict[str, Any]] = []
-    for doc in get_collection("events").find({"active": True}):
+    for doc in get_collection("events").find({"business_id": business_id, "active": True}):
         starts_at = parse_datetime(doc.get("starts_at")) or current
         ends_at = parse_datetime(doc.get("ends_at"))
         if starts_at <= current and (ends_at is None or ends_at >= current):
@@ -431,9 +602,9 @@ def get_active_events() -> List[Dict[str, Any]]:
     return active
 
 
-def get_pricing_adjustments() -> List[Dict[str, Any]]:
-    adjustments = get_active_promotions()
-    for event in get_active_events():
+def get_pricing_adjustments(business_id: str = DEFAULT_BUSINESS_ID) -> List[Dict[str, Any]]:
+    adjustments = get_active_promotions(business_id=business_id)
+    for event in get_active_events(business_id=business_id):
         if event.get("discount_type") and event.get("discount_value") is not None:
             adjustments.append(
                 {
@@ -449,21 +620,20 @@ def get_pricing_adjustments() -> List[Dict[str, Any]]:
     return adjustments
 
 
-def send_vendor_order_notification(order: OrderRecord) -> bool:
-    vendor_phone = _vendor_contact_phone()
+def send_vendor_order_notification(order: OrderRecord, business_id: str = DEFAULT_BUSINESS_ID) -> bool:
+    vendor_phone = _vendor_contact_phone(business_id)
     if not vendor_phone:
-        raise RuntimeError("VENDOR_PHONE or business contact phone is not configured.")
+        raise RuntimeError("Vendor phone is not configured for this business.")
 
-    message = build_vendor_order_message(order)
     try:
-        send_whatsapp_message(vendor_phone, message)
+        send_whatsapp_message(vendor_phone, build_vendor_order_message(order), from_number=get_business_profile(business_id).get("whatsapp_number"))
         return True
     except Exception as exc:
         print("Vendor notification failed:", str(exc))
         print("=== VENDOR ORDER ===")
         print(order.model_dump_json(indent=2))
         print("====================")
-        queue_vendor_notification(order, error=str(exc))
+        queue_vendor_notification(order, business_id=business_id, error=str(exc))
         return False
 
 
@@ -479,11 +649,12 @@ def build_vendor_order_message(order: OrderRecord) -> str:
     )
 
 
-def queue_vendor_notification(order: OrderRecord, error: str = "") -> None:
+def queue_vendor_notification(order: OrderRecord, business_id: str = DEFAULT_BUSINESS_ID, error: str = "") -> None:
     get_collection("vendor_notification_queue").update_one(
-        {"order_id": order.orderId},
+        {"business_id": business_id, "order_id": order.orderId},
         {
             "$set": {
+                "business_id": business_id,
                 "order_id": order.orderId,
                 "payload_json": order.model_dump(),
                 "status": "pending",
@@ -496,28 +667,21 @@ def queue_vendor_notification(order: OrderRecord, error: str = "") -> None:
     )
 
 
-def retry_failed_notifications() -> int:
+def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
     sent = 0
-    vendor_phone = _vendor_contact_phone()
+    vendor_phone = _vendor_contact_phone(business_id)
     if not vendor_phone:
         return sent
 
     queue = get_collection("vendor_notification_queue")
-    for row in queue.find({"status": "pending"}).sort("created_at", 1):
+    from_number = get_business_profile(business_id).get("whatsapp_number")
+    for row in queue.find({"business_id": business_id, "status": "pending"}).sort("created_at", 1):
         order = OrderRecord.model_validate(row["payload_json"])
-        message = build_vendor_order_message(order)
         try:
-            send_whatsapp_message(vendor_phone, message)
-            queue.update_one(
-                {"_id": row["_id"]},
-                {"$set": {"status": "sent", "updated_at": utc_now()}, "$inc": {"attempts": 1}},
-            )
+            send_whatsapp_message(vendor_phone, build_vendor_order_message(order), from_number=from_number)
+            queue.update_one({"_id": row["_id"]}, {"$set": {"status": "sent", "updated_at": utc_now()}, "$inc": {"attempts": 1}})
             sent += 1
         except Exception as exc:
-            print("Vendor notification retry failed:", str(exc))
-            print("=== VENDOR ORDER ===")
-            print(order.model_dump_json(indent=2))
-            print("====================")
             queue.update_one(
                 {"_id": row["_id"]},
                 {"$set": {"last_error": str(exc), "updated_at": utc_now()}, "$inc": {"attempts": 1}},
@@ -543,14 +707,14 @@ def format_offer_preview(action: Dict[str, Any], style: str) -> str:
     )
 
 
-def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_hint: str = "english") -> None:
+def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_hint: str = "english", business_id: str = DEFAULT_BUSINESS_ID) -> None:
     if style_hint == "malayalam":
-        message = f"നിങ്ങളുടെ order {order.orderId} ഇപ്പോൾ {order.status.replace('_', ' ')} ആണ്."
+        message = f"നിങ്ങളുടെ order {order.orderId} ഇപ്പോള്‍ {order.status.replace('_', ' ')} ആണ്."
     elif style_hint == "manglish":
         message = f"Ningalude order {order.orderId} ippo {order.status.replace('_', ' ')} aanu."
     else:
         message = f"Your order {order.orderId} is now {order.status.replace('_', ' ')}."
-    send_whatsapp_message(customer_phone, message)
+    send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
 
 
 def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str) -> str:
@@ -562,10 +726,10 @@ def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str)
     return f"Order {order.orderId} updated to {human_status}."
 
 
-def get_customer_broadcast_targets() -> List[str]:
-    customers = set(get_collection("orders").distinct("customer_phone"))
-    customers.update(get_collection("conversation_state").distinct("phone", {"role": "customer"}))
-    groups = set(get_business_profile().get("broadcast_groups", []))
+def get_customer_broadcast_targets(business_id: str = DEFAULT_BUSINESS_ID) -> List[str]:
+    customers = set(get_collection("orders").distinct("customer_phone", {"business_id": business_id}))
+    customers.update(get_collection("conversation_state").distinct("phone", {"business_id": business_id, "role": "customer"}))
+    groups = set(get_business_profile(business_id).get("broadcast_groups", []))
     return sorted(phone for phone in (customers | groups) if phone)
 
 
@@ -602,6 +766,7 @@ def _serialize_product(document: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     if not document:
         return None
     return {
+        "business_id": document.get("business_id", DEFAULT_BUSINESS_ID),
         "name": document["name"],
         "display_name": document.get("display_name", document["name"].title()),
         "price": float(document["price"]),
@@ -612,18 +777,120 @@ def _serialize_product(document: Optional[Dict[str, Any]]) -> Optional[Dict[str,
         "attributes": document.get("attributes", {}),
         "offer_price": float(document["offer_price"]) if document.get("offer_price") is not None else None,
         "offer_until": to_iso(parse_datetime(document.get("offer_until"))),
+        "active": bool(document.get("active", True)),
     }
 
 
-def _vendor_contact_phone() -> str:
-    profile_phone = str(get_business_profile().get("contact_phone") or "").strip()
-    env_phone = os.getenv("VENDOR_PHONE", "").strip()
-    selected = profile_phone or env_phone
+def _serialize_business(document: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not document:
+        return None
+    return {
+        "business_id": document["business_id"],
+        "slug": document.get("slug", slugify(document.get("name", "business"))),
+        "name": document.get("name", "Business"),
+        "business_type": document.get("business_type", "retail"),
+        "description": document.get("description", ""),
+        "address": document.get("address", ""),
+        "hours": document.get("hours", ""),
+        "contact_phone": document.get("contact_phone", ""),
+        "vendor_phone": document.get("vendor_phone", ""),
+        "whatsapp_number": document.get("whatsapp_number", ""),
+        "support_details": document.get("support_details", ""),
+        "policies": document.get("policies", ""),
+        "delivery_info": document.get("delivery_info", ""),
+        "broadcast_groups": document.get("broadcast_groups", []),
+        "active": bool(document.get("active", True)),
+        "created_at": to_iso(parse_datetime(document.get("created_at"))),
+        "updated_at": to_iso(parse_datetime(document.get("updated_at"))),
+    }
+
+
+def _find_reusable_business(vendor_phone: str, whatsapp_number: str, slug: str) -> Optional[Dict[str, Any]]:
+    candidates = []
+    if vendor_phone:
+        candidates.append({"vendor_phone": vendor_phone})
+    if whatsapp_number:
+        candidates.append({"whatsapp_number": whatsapp_number})
+    if slug:
+        candidates.append({"slug": slug})
+    if not candidates:
+        return None
+    return get_collection("businesses").find_one({"active": False, "$or": candidates})
+
+
+def _ensure_business_conflicts_clear(
+    vendor_phone: str,
+    whatsapp_number: str,
+    slug: str,
+    exclude_business_id: str = "",
+) -> None:
+    conflicts = []
+    if vendor_phone:
+        conflicts.append(("vendor_phone", vendor_phone))
+    if whatsapp_number:
+        conflicts.append(("whatsapp_number", whatsapp_number))
+    if slug:
+        conflicts.append(("slug", slug))
+    for field, value in conflicts:
+        query: Dict[str, Any] = {field: value, "active": True}
+        if exclude_business_id:
+            query["business_id"] = {"$ne": exclude_business_id}
+        existing = get_collection("businesses").find_one(query)
+        if existing:
+            raise ValueError(f"An active business already uses this {field.replace('_', ' ')}.")
+
+
+def _release_inactive_business_conflicts(
+    *,
+    current_business_id: str = "",
+    vendor_phone: str,
+    whatsapp_number: str,
+    slug: str,
+) -> None:
+    candidates = []
+    if vendor_phone:
+        candidates.append({"vendor_phone": vendor_phone})
+    if whatsapp_number:
+        candidates.append({"whatsapp_number": whatsapp_number})
+    if slug:
+        candidates.append({"slug": slug})
+    if not candidates:
+        return
+
+    query: Dict[str, Any] = {"active": False, "$or": candidates}
+    if current_business_id:
+        query["business_id"] = {"$ne": current_business_id}
+
+    for business in get_collection("businesses").find(query):
+        _archive_deleted_business_identity(str(business.get("business_id") or ""))
+
+
+def _archive_deleted_business_identity(business_id: str) -> None:
+    if not business_id:
+        return
+    now = utc_now()
+    archive_suffix = f"archived-{business_id}"
+    get_collection("businesses").update_one(
+        {"business_id": business_id, "active": False},
+        {
+            "$set": {
+                "vendor_phone": f"archived:{archive_suffix}",
+                "whatsapp_number": f"archived:{archive_suffix}",
+                "slug": archive_suffix,
+                "updated_at": now,
+            }
+        },
+    )
+
+
+def _vendor_contact_phone(business_id: str) -> str:
+    profile = get_business_profile(business_id)
+    selected = str(profile.get("contact_phone") or profile.get("vendor_phone") or "").strip()
     return normalize_phone(selected) if selected else ""
 
 
-def _notify_vendor_support_ticket(ticket: Dict[str, Any]) -> None:
-    vendor_phone = _vendor_contact_phone()
+def _notify_vendor_support_ticket(ticket: Dict[str, Any], business_id: str = DEFAULT_BUSINESS_ID) -> None:
+    vendor_phone = _vendor_contact_phone(business_id)
     if not vendor_phone:
         return
     message = (
@@ -634,7 +901,7 @@ def _notify_vendor_support_ticket(ticket: Dict[str, Any]) -> None:
         f"Order ID: {ticket.get('order_id') or 'N/A'}"
     )
     try:
-        send_whatsapp_message(vendor_phone, message)
+        send_whatsapp_message(vendor_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
     except Exception as exc:
         print("Support ticket notification failed:", str(exc))
         print(message)

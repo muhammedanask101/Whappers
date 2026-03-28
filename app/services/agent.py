@@ -1,6 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional
 
+from app.db.mongo import DEFAULT_BUSINESS_ID
 from app.services.broadcast import execute_broadcast
 from app.services.llm import call_llm, detect_language_style, is_confirmation_no, is_confirmation_yes, safe_parse_json
 from app.services.order import build_order_preview, create_order, get_latest_order, get_latest_vendor_actionable_order, update_order_status
@@ -60,18 +61,19 @@ VENDOR_ONLY_TOOLS = {
 
 
 def process_incoming_message(message: str, user: Dict[str, str]) -> str:
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
     style = detect_language_style(message)
-    update_last_language(user["phone"], user["role"], style, message)
-    state = get_conversation_state(user["phone"])
-    history = get_recent_history(user["phone"], limit=10)
+    update_last_language(user["phone"], user["role"], style, message, business_id=business_id)
+    state = get_conversation_state(user["phone"], business_id=business_id)
+    history = get_recent_history(user["phone"], business_id=business_id, limit=10)
 
     pending_reply = _handle_pending_action(message, user, style, state)
     if pending_reply is not None:
-        _store_turn(user["phone"], message, pending_reply)
+        _store_turn(user["phone"], message, pending_reply, business_id=business_id)
         return pending_reply
 
     reply = agent_loop(message=message, user=user, state=state, history=history)
-    _store_turn(user["phone"], message, reply)
+    _store_turn(user["phone"], message, reply, business_id=business_id)
     return reply
 
 
@@ -94,7 +96,7 @@ def agent_loop(message: str, user: Dict[str, str], state: Dict[str, Any], histor
 
     validated = validate_and_fix_args(action, arguments, state, message, user)
     result = execute_tool(action, validated, state, user, style, parsed.get("message", ""))
-    return result.get("message") or _fallback_response(message, user, style, state)
+    return result.get("message") or str(parsed.get("message") or "").strip() or _fallback_response(message, user, style, state)
 
 
 def _call_agent_llm(*, message: str, user: Dict[str, str], state: Dict[str, Any], history: List[Dict[str, str]], style: str) -> str:
@@ -149,72 +151,89 @@ Available tools: {json.dumps(TOOL_DEFINITIONS, ensure_ascii=False)}
 
 
 def _fallback_response(message: str, user: Dict[str, str], style: str, state: Dict[str, Any]) -> str:
-    lowered = message.strip().lower()
-
     if user.get("role") == "vendor":
-        if any(token in lowered for token in ["accept", "accepted", "dispatch", "delivered", "reject", "rejected"]):
-            status = _infer_vendor_status(lowered)
-            if status:
-                result = execute_tool("update_order_status", {"status": status, "order_id": None}, state, user, style, "")
-                return result.get("message", "I couldn’t update the order right now.")
-        if any(token in lowered for token in ["product", "catalog", "business", "profile", "offer", "promotion", "event", "broadcast"]):
-            return "I can help manage products, offers, promotions, events, business details, and broadcasts. Tell me the exact change you want."
-        return "I can help you manage orders, products, offers, promotions, events, business details, and broadcasts. Tell me what you want to do."
+        return "I can manage products, offers, promotions, business details, broadcasts, and order status. Tell me the exact change you want."
 
-    if lowered in {"hi", "hello", "hey", "hey there"}:
-        return "Hey! What would you like today?"
-
-    if any(token in lowered for token in ["where is my order", "track", "status", "delayed", "didn't arrive", "wrong item", "cancel order", "issue", "problem", "support"]):
-        if any(token in lowered for token in ["wrong item", "didn't arrive", "delayed", "issue", "problem", "cancel order"]):
-            result = execute_tool("create_support_ticket", {"customer_phone": user["phone"], "issue": message}, state, user, style, "")
-            return result.get("message", "I’ve noted the issue and will help you with it.")
-        result = execute_tool("get_order_status", {"phone": user["phone"], "context": message}, state, user, style, "")
-        return result.get("message", _localized_missing_order(style))
-
-    if any(char.isdigit() for char in lowered):
-        items = _extract_basic_items(lowered)
+    stripped = message.strip()
+    if any(char.isdigit() for char in stripped):
+        items = _extract_basic_items(stripped)
         if items:
             validated = validate_and_fix_args("create_order", {"items": items}, state, message, user)
             result = execute_tool("create_order", validated, state, user, style, "")
-            return result.get("message", "I can help place that order.")
+            if result.get("message"):
+                return result["message"]
 
-    if any(token in lowered for token in ["price", "under", "below", "above", "cheap", "budget", "sort", "filter", "show", "available", "have", "options", "products", "items", "drink", "snack", "shoe", "shirt", "dress"]):
-        args = validate_and_fix_args("get_products", {"search": message}, state, message, user)
-        result = execute_tool("get_products", args, state, user, style, "")
-        return result.get("message", "Here are some options you might like.")
+    if 0 < len(stripped.split()) <= 2:
+        if style == "manglish":
+            return "Hi, njan sahayikkam. Enthanu vendath?"
+        if style == "malayalam":
+            return "ഹലോ, ഞാൻ സഹായിക്കാം. എന്താണ് വേണ്ടത്?"
+        return "Hi, I can help. What would you like?"
 
-    if any(token in lowered for token in ["address", "hours", "time", "location", "delivery", "contact", "policy", "return"]):
-        result = execute_tool("get_business_info", {"topic": _infer_business_topic(lowered)}, state, user, style, "")
-        return result.get("message", "I can share our business details.")
+    args = validate_and_fix_args("get_products", {"search": message}, state, message, user)
+    result = execute_tool("get_products", args, state, user, style, "")
+    if result.get("message"):
+        return result["message"]
 
-    product = get_product_details(message)
-    if product:
-        return format_product_detail_response(product, style)
-
-    return "I can help you explore products, place an order, track an order, or get support. Tell me what you need."
+    if style == "manglish":
+        return "Njan productsum ordersum supportum handle cheyyam. Kurachu details parayu."
+    if style == "malayalam":
+        return "Products, orders, support എന്നിവയിൽ ഞാൻ സഹായിക്കാം. കൂടുതൽ വിശദമായി പറയൂ."
+    return "I can help with products, orders, and support. Tell me a bit more."
 
 
 def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, Any], message: str, user: Dict[str, str]) -> Dict[str, Any]:
     safe_args = dict(args or {})
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
 
     if action == "create_order":
         draft = _get_draft_data(state)
         draft_items = draft.get("items", [])
         draft_address = str(draft.get("address") or "").strip()
+        raw_items = list(safe_args.get("items", []) or [])
+        single_name = normalize_product_name(
+            str(
+                safe_args.get("product_name")
+                or safe_args.get("product")
+                or safe_args.get("name")
+                or safe_args.get("item")
+                or ""
+            ).strip()
+        )
+        if single_name:
+            raw_items.append(
+                {
+                    "name": single_name,
+                    "qty": safe_args.get("quantity", safe_args.get("qty", 1)),
+                }
+            )
         normalized_items = []
-        for item in safe_args.get("items", []) or []:
-            name = normalize_product_name(str(item.get("name", "")).strip())
-            qty = _safe_int(item.get("qty", 1), default=1)
-            if name and product_exists(name):
+        for item in raw_items:
+            name = normalize_product_name(
+                str(
+                    item.get("name")
+                    or item.get("product")
+                    or item.get("item")
+                    or item.get("title")
+                    or ""
+                ).strip()
+            )
+            qty = _safe_int(
+                item.get("qty", item.get("quantity", item.get("count", item.get("units", 1)))),
+                default=1,
+            )
+            if name and product_exists(name, business_id=business_id):
                 normalized_items.append({"name": name, "qty": qty})
         operation = str(safe_args.get("operation") or safe_args.get("mode") or "add").strip().lower()
+        if operation == "get":
+            return {"items": draft_items, "address": draft_address, "operation": "get", "business_id": business_id}
         if operation not in {"add", "replace", "remove"}:
             operation = "add"
         merged = apply_cart_operation(draft_items, normalized_items, operation)
         address = str(safe_args.get("address") or "").strip() or draft_address
         if not address and is_address(message) and draft_items and not normalized_items:
             address = message.strip()
-        return {"items": merged, "address": address, "operation": operation}
+        return {"items": merged, "address": address, "operation": operation, "business_id": business_id}
 
     if action == "get_products":
         requested_category = str(safe_args.get("filter_category") or "").strip().lower() or None
@@ -242,17 +261,18 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "max_price": max_price,
             "tags": [str(tag).strip().lower() for tag in tags if str(tag).strip()] if tags is not None else None,
             "limit": min(max(limit, 1), 20),
+            "business_id": business_id,
         }
 
     if action == "get_product_details":
         name = normalize_product_name(str(safe_args.get("name") or safe_args.get("product") or "").strip())
-        return {"name": name or normalize_product_name(message)}
+        return {"name": name or normalize_product_name(message), "business_id": business_id}
 
     if action == "get_business_info":
-        return {"topic": str(safe_args.get("topic") or "").strip().lower() or None}
+        return {"topic": str(safe_args.get("topic") or "").strip().lower() or None, "business_id": business_id}
 
     if action == "get_order_status":
-        return {"phone": user["phone"], "context": message}
+        return {"phone": user["phone"], "context": message, "business_id": business_id}
 
     if action == "create_support_ticket":
         return {
@@ -260,6 +280,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "issue": str(safe_args.get("issue") or message).strip(),
             "order_id": str(safe_args.get("order_id") or safe_args.get("orderId") or "").strip().upper() or None,
             "preferred_contact": str(safe_args.get("preferred_contact") or "").strip() or None,
+            "business_id": business_id,
         }
 
     if action == "update_order_status":
@@ -267,7 +288,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
         order_id = str(safe_args.get("order_id") or safe_args.get("orderId") or "").strip().upper() or None
         if status not in ALLOWED_ORDER_STATUSES:
             status = ""
-        return {"status": status, "order_id": order_id}
+        return {"status": status, "order_id": order_id, "business_id": business_id}
 
     if action == "add_product":
         tags = safe_args.get("tags", [])
@@ -284,6 +305,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "description": str(safe_args.get("description") or "").strip(),
             "tags": [str(tag).strip().lower() for tag in tags if str(tag).strip()],
             "attributes": attributes,
+            "business_id": business_id,
         }
 
     if action == "update_product":
@@ -305,16 +327,17 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "tags": [str(tag).strip().lower() for tag in tags if str(tag).strip()] if tags is not None else None,
             "attributes": attributes,
             "active": active,
+            "business_id": business_id,
         }
 
     if action == "delete_product":
-        return {"name": normalize_product_name(str(safe_args.get("name") or "").strip())}
+        return {"name": normalize_product_name(str(safe_args.get("name") or "").strip()), "business_id": business_id}
 
     if action == "create_offer":
         product = normalize_product_name(str(safe_args.get("product") or "").strip())
-        if not product_exists(product):
+        if not product_exists(product, business_id=business_id):
             product = ""
-        return {"product": product, "price": _safe_float(safe_args.get("price")), "date": str(safe_args.get("date") or "").strip() or None}
+        return {"product": product, "price": _safe_float(safe_args.get("price")), "date": str(safe_args.get("date") or "").strip() or None, "business_id": business_id}
 
     if action == "create_promotion":
         scope = str(safe_args.get("scope") or "").strip().lower() or "global"
@@ -323,7 +346,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
         target = str(safe_args.get("target") or "").strip().lower() or None
         if scope == "product" and target:
             target = normalize_product_name(target)
-            if not product_exists(target):
+            if not product_exists(target, business_id=business_id):
                 target = ""
         return {
             "title": str(safe_args.get("title") or "").strip(),
@@ -334,6 +357,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "starts_at": str(safe_args.get("starts_at") or "").strip() or None,
             "ends_at": str(safe_args.get("ends_at") or "").strip() or None,
             "broadcast_text": str(safe_args.get("broadcast_text") or "").strip() or None,
+            "business_id": business_id,
         }
 
     if action == "create_event":
@@ -341,7 +365,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
         promotion_target = str(safe_args.get("promotion_target") or "").strip().lower() or None
         if promotion_scope == "product" and promotion_target:
             promotion_target = normalize_product_name(promotion_target)
-            if not product_exists(promotion_target):
+            if not product_exists(promotion_target, business_id=business_id):
                 promotion_target = ""
         return {
             "title": str(safe_args.get("title") or "").strip(),
@@ -353,6 +377,7 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "discount_type": str(safe_args.get("discount_type") or "").strip().lower() or None,
             "discount_value": _safe_float(safe_args.get("discount_value")),
             "broadcast_text": str(safe_args.get("broadcast_text") or "").strip() or None,
+            "business_id": business_id,
         }
 
     if action == "update_business_info":
@@ -370,11 +395,13 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "policies": str(safe_args.get("policies") or "").strip() or None,
             "delivery_info": str(safe_args.get("delivery_info") or "").strip() or None,
             "broadcast_groups": [str(item).strip() for item in groups if str(item).strip()] if groups is not None else None,
+            "business_id": business_id,
         }
 
     if action == "send_broadcast":
-        return {"message": str(safe_args.get("message") or "").strip()}
+        return {"message": str(safe_args.get("message") or "").strip(), "business_id": business_id}
 
+    safe_args.setdefault("business_id", business_id)
     return safe_args
 
 
@@ -421,7 +448,7 @@ def _handle_pending_action(message: str, user: Dict[str, str], style: str, state
         return None
     if pending.get("type") == "confirm_tool":
         if is_confirmation_no(message):
-            clear_pending_action(user["phone"])
+            clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
             return _localized_cancel(style)
         if not is_confirmation_yes(message):
             return None
@@ -446,16 +473,21 @@ def _handle_pending_action(message: str, user: Dict[str, str], style: str, state
             return _finalize_confirmed_business_info(arguments, user)
         if tool == "send_broadcast":
             return _finalize_confirmed_broadcast(arguments, user)
-        clear_pending_action(user["phone"])
+        clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
         return "Sorry, I didn’t get that. Can you rephrase?"
-    if pending.get("type") == "draft_tool" and is_confirmation_no(message):
-        clear_pending_action(user["phone"])
-        return _localized_cancel(style)
+    if pending.get("type") == "draft_tool":
+        if is_confirmation_no(message):
+            clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
+            return _localized_cancel(style)
+        draft_tool = pending.get("data", {}).get("tool")
+        if draft_tool == "create_order":
+            return _handle_order_draft_progress(message, user, style, state)
     return None
 
 
 def _tool_get_products(args: Dict[str, Any], style: str) -> Dict[str, str]:
     products = get_product_catalog(
+        business_id=args.get("business_id") or DEFAULT_BUSINESS_ID,
         filter_category=args.get("filter_category"),
         search=args.get("search"),
         min_price=args.get("min_price"),
@@ -469,30 +501,36 @@ def _tool_get_products(args: Dict[str, Any], style: str) -> Dict[str, str]:
 
 
 def _tool_get_product_details(args: Dict[str, Any], style: str) -> Dict[str, str]:
-    product = get_product_details(args.get("name", ""))
+    business_id = args.get("business_id") or DEFAULT_BUSINESS_ID
+    product = get_product_details(args.get("name", ""), business_id=business_id)
     if not product:
-        return {"message": format_product_response(get_product_catalog(search=args.get("name")), style, intro="I couldn’t find an exact match. Here are the closest options:")}
+        fallback = get_product_catalog(business_id=business_id, search=args.get("name"))
+        return {"message": format_product_response(fallback, style, intro="I could not find an exact match. Here are the closest options:")}
     return {"message": format_product_detail_response(product, style)}
 
 
 def _tool_get_business_info(args: Dict[str, Any], style: str) -> Dict[str, str]:
-    return {"message": format_business_info_response(get_business_profile(), style, args.get("topic"))}
+    return {"message": format_business_info_response(get_business_profile(args.get("business_id") or DEFAULT_BUSINESS_ID), style, args.get("topic"))}
 
 
 def _tool_create_order(args: Dict[str, Any], user: Dict[str, str], style: str) -> Dict[str, str]:
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
     items = args.get("items", [])
     address = str(args.get("address") or "").strip()
+    operation = str(args.get("operation") or "add").strip().lower()
+    if operation == "get" and items:
+        return {"message": _draft_message(items, style, operation="add")}
     if not items:
-        return {"message": format_product_response(get_product_catalog(), style, intro="I can help with these products:")}
+        return {"message": format_product_response(get_product_catalog(business_id=business_id), style, intro="I can help with these products:")}
     if not address:
         save_pending_draft(user, "create_order", style, _summarize_items(items), {"items": items, "address": ""})
         return {"message": _draft_message(items, style, operation=args.get("operation", "add"))}
     _queue_confirmation(user, style, "create_order", {"items": items, "address": address}, address)
-    return {"message": build_order_preview(items, address, style=style)["message"]}
+    return {"message": build_order_preview(items, address, style=style, business_id=business_id)["message"]}
 
 
 def _tool_get_order_status(args: Dict[str, Any], style: str) -> Dict[str, str]:
-    order = get_latest_order(args.get("phone", ""))
+    order = get_latest_order(args.get("phone", ""), business_id=args.get("business_id") or DEFAULT_BUSINESS_ID)
     if not order:
         return {"message": _localized_missing_order(style)}
     status = order.status.replace("_", " ")
@@ -507,8 +545,9 @@ def _tool_create_support_ticket(args: Dict[str, Any], style: str) -> Dict[str, s
     issue = str(args.get("issue") or "").strip()
     if not issue:
         return {"message": "Tell me what went wrong and I’ll log it for the vendor right away."}
-    ticket = create_support_ticket(customer_phone=args.get("customer_phone", ""), issue=issue, order_id=args.get("order_id"), preferred_contact=args.get("preferred_contact"))
-    contact_phone = get_business_profile().get("contact_phone") or "the vendor"
+    business_id = args.get("business_id") or DEFAULT_BUSINESS_ID
+    ticket = create_support_ticket(business_id=business_id, customer_phone=args.get("customer_phone", ""), issue=issue, order_id=args.get("order_id"), preferred_contact=args.get("preferred_contact"))
+    contact_phone = get_business_profile(business_id).get("contact_phone") or "the vendor"
     if style == "manglish":
         return {"message": f"Njan support ticket {ticket['ticket_id']} create cheythu. Vendorine notify cheythittundu. Direct contact venel {contact_phone} use cheyyam."}
     if style == "malayalam":
@@ -517,17 +556,18 @@ def _tool_create_support_ticket(args: Dict[str, Any], style: str) -> Dict[str, s
 
 
 def _tool_update_order_status(args: Dict[str, Any], style: str) -> Dict[str, str]:
+    business_id = args.get("business_id") or DEFAULT_BUSINESS_ID
     status = args.get("status")
     if status not in ALLOWED_ORDER_STATUSES:
         return {"message": "I need a valid order status like accepted, rejected, out for delivery, or delivered."}
-    target = get_latest_vendor_actionable_order(target_order_id=args.get("order_id"), desired_status=status)
+    target = get_latest_vendor_actionable_order(target_order_id=args.get("order_id"), desired_status=status, business_id=business_id)
     if not target:
         return {"message": "I couldn’t find the matching order to update."}
-    updated = update_order_status(target.orderId, status)
+    updated = update_order_status(target.orderId, status, business_id=business_id)
     if not updated:
         return {"message": "I couldn’t update the order right now."}
-    customer_state = get_conversation_state(updated.customerPhone)
-    notify_customer_order_update(updated.customerPhone, updated, customer_state.get("lastLanguage", "english"))
+    customer_state = get_conversation_state(updated.customerPhone, business_id=business_id)
+    notify_customer_order_update(updated.customerPhone, updated, customer_state.get("lastLanguage", "english"), business_id=business_id)
     return {"message": generate_vendor_acknowledgement(updated, style, updated.status)}
 
 
@@ -541,7 +581,7 @@ def _tool_add_product(args: Dict[str, Any], user: Dict[str, str], style: str) ->
 def _tool_update_product(args: Dict[str, Any], user: Dict[str, str], style: str) -> Dict[str, str]:
     if not args.get("name"):
         return {"message": "Tell me which product you want to update."}
-    if not product_exists(args.get("name", "")):
+    if not product_exists(args.get("name", ""), business_id=user.get("business_id") or DEFAULT_BUSINESS_ID):
         return {"message": "I couldn’t find that product in the catalog."}
     _queue_confirmation(user, style, "update_product", args, args.get("name", ""))
     return {"message": _format_product_change_preview("update", args)}
@@ -550,7 +590,7 @@ def _tool_update_product(args: Dict[str, Any], user: Dict[str, str], style: str)
 def _tool_delete_product(args: Dict[str, Any], user: Dict[str, str], style: str) -> Dict[str, str]:
     if not args.get("name"):
         return {"message": "Tell me which product you want removed from the catalog."}
-    if not product_exists(args.get("name", "")):
+    if not product_exists(args.get("name", ""), business_id=user.get("business_id") or DEFAULT_BUSINESS_ID):
         return {"message": "I couldn’t find that product in the catalog."}
     _queue_confirmation(user, style, "delete_product", args, args.get("name", ""))
     return {"message": f"Product removal preview:\nRemove {str(args.get('name', '')).title()} from the catalog.\nReply YES to confirm or NO to cancel."}
@@ -590,80 +630,118 @@ def _tool_send_broadcast(args: Dict[str, Any], user: Dict[str, str], style: str)
     if not message:
         return {"message": "Tell me the message you want to broadcast, and I’ll prepare it."}
     _queue_confirmation(user, style, "send_broadcast", {"message": message}, message)
-    targets = get_customer_broadcast_targets()
+    targets = get_customer_broadcast_targets(user.get("business_id") or DEFAULT_BUSINESS_ID)
     return {"message": f"Broadcast preview:\n{message}\nRecipients: {len(targets)}\nReply YES to send or NO to cancel."}
 
 
 def _finalize_confirmed_order(arguments: Dict[str, Any], user: Dict[str, str], style: str) -> str:
-    order = create_order(user["phone"], arguments.get("items", []), arguments.get("address", ""))
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    order = create_order(business_id, user["phone"], arguments.get("items", []), arguments.get("address", ""))
     print("ORDER CREATED:", order.model_dump())
-    vendor_notified = send_vendor_order_notification(order)
-    clear_pending_action(user["phone"])
+    vendor_notified = send_vendor_order_notification(order, business_id=business_id)
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     if vendor_notified:
         return f"Order placed successfully. Order ID: {order.orderId}. Total: Rs {order.total:.2f}."
     return f"Your order is placed successfully. Order ID: {order.orderId}. Vendor will be notified shortly."
 
 
 def _finalize_confirmed_add_product(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = add_product(name=arguments.get("name", ""), price=float(arguments.get("price")), unit=arguments.get("unit") or "unit", category=arguments.get("category"), description=arguments.get("description", ""), tags=arguments.get("tags") or [], attributes=arguments.get("attributes") or {})
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = add_product(business_id=business_id, name=arguments.get("name", ""), price=float(arguments.get("price")), unit=arguments.get("unit") or "unit", category=arguments.get("category"), description=arguments.get("description", ""), tags=arguments.get("tags") or [], attributes=arguments.get("attributes") or {})
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     return f"Product added: {result['display_name']} at Rs {result['price']:.2f} per {result['unit']}."
 
 
 def _finalize_confirmed_update_product(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = update_product(name=arguments.get("name", ""), price=arguments.get("price"), unit=arguments.get("unit"), category=arguments.get("category"), description=arguments.get("description"), tags=arguments.get("tags"), attributes=arguments.get("attributes"), active=arguments.get("active"))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = update_product(business_id=business_id, name=arguments.get("name", ""), price=arguments.get("price"), unit=arguments.get("unit"), category=arguments.get("category"), description=arguments.get("description"), tags=arguments.get("tags"), attributes=arguments.get("attributes"), active=arguments.get("active"))
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     if not result:
         return "I couldn’t update that product right now."
     return f"Product updated: {result['display_name']} is now Rs {result['price']:.2f} per {result['unit']}."
 
 
 def _finalize_confirmed_delete_product(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    deleted = delete_product(arguments.get("name", ""))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    deleted = delete_product(arguments.get("name", ""), business_id=business_id)
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     if not deleted:
         return "I couldn’t remove that product right now."
     return f"{str(arguments.get('name', '')).title()} has been removed from the active catalog."
 
 
 def _finalize_confirmed_offer(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = update_product_offer(arguments.get("product", ""), float(arguments.get("price")), arguments.get("date"))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = update_product_offer(arguments.get("product", ""), float(arguments.get("price")), arguments.get("date"), business_id=business_id)
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     return f"Offer created for {result['display_name']} at Rs {result['offer_price']:.2f}."
 
 
 def _finalize_confirmed_promotion(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = create_promotion(title=arguments.get("title", ""), scope=arguments.get("scope") or "global", target=arguments.get("target"), discount_type=arguments.get("discount_type") or "percent", discount_value=float(arguments.get("discount_value")), starts_at=arguments.get("starts_at"), ends_at=arguments.get("ends_at"), broadcast_text=arguments.get("broadcast_text"))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = create_promotion(business_id=business_id, title=arguments.get("title", ""), scope=arguments.get("scope") or "global", target=arguments.get("target"), discount_type=arguments.get("discount_type") or "percent", discount_value=float(arguments.get("discount_value")), starts_at=arguments.get("starts_at"), ends_at=arguments.get("ends_at"), broadcast_text=arguments.get("broadcast_text"))
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     if result.get("broadcast_text"):
-        broadcast_result = execute_broadcast(result["broadcast_text"], get_customer_broadcast_targets())
+        broadcast_result = execute_broadcast(result["broadcast_text"], get_customer_broadcast_targets(business_id), from_number=get_business_profile(business_id).get("whatsapp_number", ""))
         return f"Promotion created: {result['title']}.\nBroadcast sent to {broadcast_result['sent']} recipients."
     return f"Promotion created: {result['title']}."
 
 
 def _finalize_confirmed_event(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = create_event(title=arguments.get("title", ""), description=arguments.get("description", ""), starts_at=arguments.get("starts_at"), ends_at=arguments.get("ends_at"), promotion_scope=arguments.get("promotion_scope"), promotion_target=arguments.get("promotion_target"), discount_type=arguments.get("discount_type"), discount_value=arguments.get("discount_value"), broadcast_text=arguments.get("broadcast_text"))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = create_event(business_id=business_id, title=arguments.get("title", ""), description=arguments.get("description", ""), starts_at=arguments.get("starts_at"), ends_at=arguments.get("ends_at"), promotion_scope=arguments.get("promotion_scope"), promotion_target=arguments.get("promotion_target"), discount_type=arguments.get("discount_type"), discount_value=arguments.get("discount_value"), broadcast_text=arguments.get("broadcast_text"))
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     if result.get("broadcast_text"):
-        broadcast_result = execute_broadcast(result["broadcast_text"], get_customer_broadcast_targets())
+        broadcast_result = execute_broadcast(result["broadcast_text"], get_customer_broadcast_targets(business_id), from_number=get_business_profile(business_id).get("whatsapp_number", ""))
         return f"Event created: {result['title']}.\nBroadcast sent to {broadcast_result['sent']} recipients."
     return f"Event created: {result['title']}."
 
 
 def _finalize_confirmed_business_info(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = update_business_profile(name=arguments.get("name"), business_type=arguments.get("business_type"), description=arguments.get("description"), address=arguments.get("address"), hours=arguments.get("hours"), contact_phone=arguments.get("contact_phone"), support_details=arguments.get("support_details"), policies=arguments.get("policies"), delivery_info=arguments.get("delivery_info"), broadcast_groups=arguments.get("broadcast_groups"))
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = update_business_profile(business_id=business_id, name=arguments.get("name"), business_type=arguments.get("business_type"), description=arguments.get("description"), address=arguments.get("address"), hours=arguments.get("hours"), contact_phone=arguments.get("contact_phone"), support_details=arguments.get("support_details"), policies=arguments.get("policies"), delivery_info=arguments.get("delivery_info"), broadcast_groups=arguments.get("broadcast_groups"))
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     return f"Business profile updated for {result['name']}."
 
 
 def _finalize_confirmed_broadcast(arguments: Dict[str, Any], user: Dict[str, str]) -> str:
-    result = execute_broadcast(arguments.get("message", ""), get_customer_broadcast_targets())
-    clear_pending_action(user["phone"])
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    result = execute_broadcast(arguments.get("message", ""), get_customer_broadcast_targets(business_id), from_number=get_business_profile(business_id).get("whatsapp_number", ""))
+    clear_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID)
     return f"Broadcast sent to {result['sent']} recipients."
 
 
 def save_pending_draft(user: Dict[str, str], tool_name: str, style: str, last_message: str, partial_data: Dict[str, Any]) -> None:
-    set_pending_action(user["phone"], role=user["role"], action_type="draft_tool", data={"tool": tool_name, "data": partial_data}, last_language=style, last_message=last_message)
+    set_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID, role=user["role"], action_type="draft_tool", data={"tool": tool_name, "data": partial_data}, last_language=style, last_message=last_message)
+
+
+def _handle_order_draft_progress(message: str, user: Dict[str, str], style: str, state: Dict[str, Any]) -> Optional[str]:
+    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    draft = _get_draft_data(state)
+    items = list(draft.get("items", []))
+    address = str(draft.get("address") or "").strip()
+    stripped = message.strip()
+
+    if not items:
+        clear_pending_action(user["phone"], business_id=business_id)
+        return None
+
+    if is_address(stripped):
+        address = stripped
+        _queue_confirmation(user, style, "create_order", {"items": items, "address": address}, address)
+        return build_order_preview(items, address, style=style, business_id=business_id)["message"]
+
+    extracted = _extract_basic_items(stripped, business_id=business_id)
+    if extracted:
+        merged = apply_cart_operation(items, extracted, "add")
+        save_pending_draft(user, "create_order", style, _summarize_items(merged), {"items": merged, "address": address})
+        return _draft_message(merged, style, operation="add")
+
+    if style == "manglish":
+        return "Order draft save cheythittundu. Iniyum items add cheyyam, allenkil delivery address ayakkam."
+    if style == "malayalam":
+        return "Order draft save ചെയ്തിട്ടുണ്ട്. കൂടുതൽ items add ചെയ്യാം, അല്ലെങ്കിൽ delivery address അയക്കാം."
+    return "Your order draft is saved. You can add more items or send your delivery address."
 
 
 def _get_draft_data(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -709,8 +787,8 @@ def apply_cart_operation(existing_items: List[Dict[str, Any]], incoming_items: L
     return merge_items(existing_items + incoming_items)
 
 
-def product_exists(name: str) -> bool:
-    return normalize_product_name(name) in get_product_catalog_map()
+def product_exists(name: str, business_id: str = DEFAULT_BUSINESS_ID) -> bool:
+    return normalize_product_name(name) in get_product_catalog_map(business_id=business_id)
 
 
 def infer_category_from_message(message: str) -> Optional[str]:
@@ -729,8 +807,11 @@ def infer_category_from_message(message: str) -> Optional[str]:
 def is_address(text: str) -> bool:
     if len(text.split()) < 3:
         return False
-    if any(word in text.lower() for word in ["want", "need", "give", "add", "order", "product"]):
+    lowered = text.lower()
+    if any(word in lowered for word in ["want", "need", "add", "order", "product", "price", "available"]):
         return False
+    if any(char.isdigit() for char in text) or any(token in lowered for token in ["road", "street", "lane", "house", "flat", "near", "pin", "city", "district"]):
+        return True
     return True
 
 
@@ -841,12 +922,12 @@ def _format_business_profile_preview(args: Dict[str, Any]) -> str:
 
 
 def _queue_confirmation(user: Dict[str, str], style: str, tool: str, arguments: Dict[str, Any], last_message: str) -> None:
-    set_pending_action(user["phone"], role=user["role"], action_type="confirm_tool", data={"tool": tool, "arguments": arguments}, last_language=style, last_message=last_message)
+    set_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID, role=user["role"], action_type="confirm_tool", data={"tool": tool, "arguments": arguments}, last_language=style, last_message=last_message)
 
 
-def _store_turn(phone: str, user_message: str, assistant_message: str) -> None:
-    append_history(phone, "user", user_message)
-    append_history(phone, "assistant", assistant_message)
+def _store_turn(phone: str, user_message: str, assistant_message: str, business_id: str = DEFAULT_BUSINESS_ID) -> None:
+    append_history(phone, "user", user_message, business_id=business_id)
+    append_history(phone, "assistant", assistant_message, business_id=business_id)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -863,13 +944,13 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def _extract_basic_items(message: str) -> List[Dict[str, Any]]:
+def _extract_basic_items(message: str, business_id: str = DEFAULT_BUSINESS_ID) -> List[Dict[str, Any]]:
     words = [word.strip(",. ") for word in message.split() if word.strip(",. ")]
     items: List[Dict[str, Any]] = []
     for index, word in enumerate(words):
         if word.isdigit() and index + 1 < len(words):
             product_name = normalize_product_name(words[index + 1])
-            if product_exists(product_name):
+            if product_exists(product_name, business_id=business_id):
                 items.append({"name": product_name, "qty": int(word)})
     return items
 
@@ -1042,3 +1123,8 @@ TOOL_DEFINITIONS = [
     {"name": "update_business_info", "description": "Update business profile details such as store name, type, description, address, hours, contact phone, support details, policies, delivery info, and broadcast groups."},
     {"name": "send_broadcast", "description": "Send a marketing broadcast to known customers and configured WhatsApp groups."},
 ]
+
+
+
+
+

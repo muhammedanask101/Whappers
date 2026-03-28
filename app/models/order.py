@@ -10,10 +10,10 @@ class OrderItem(BaseModel):
 
 class OrderRecord(BaseModel):
     orderId: str
+    businessId: str
     customerPhone: str
     items: List[OrderItem]
     total: float
     status: Literal["pending", "accepted", "out_for_delivery", "delivered", "rejected"]
     address: str
     createdAt: str
-

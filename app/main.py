@@ -2,10 +2,14 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI
+from starlette.middleware.sessions import SessionMiddleware
 
 from app.db.database import init_db
 from app.db.mongo import get_mongo_database
+from app.routes.admin_api import router as admin_api_router
+from app.routes.admin import router as admin_router
 from app.routes.whatsapp import router as whatsapp_router
+from app.services.admin import ensure_manager_seed
 
 
 def load_env_file() -> None:
@@ -33,12 +37,21 @@ app = FastAPI(
     description="FastAPI backend for assisted conversational commerce on WhatsApp.",
 )
 
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("MANAGER_SESSION_SECRET", "change-this-manager-secret"),
+    same_site="lax",
+    https_only=False,
+)
 app.include_router(whatsapp_router)
+app.include_router(admin_router)
+app.include_router(admin_api_router)
 
 
 @app.on_event("startup")
 def startup_checks() -> None:
-    get_mongo_database()
+    app.state.mongo_db = get_mongo_database()
+    ensure_manager_seed()
 
 
 @app.get("/health")
