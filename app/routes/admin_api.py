@@ -6,6 +6,8 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from app.db.mongo import get_collection, parse_datetime
 from app.services.admin import delete_business
 from app.services.vendor import create_business, get_business_by_id, list_businesses, update_business, get_product_catalog
+from app.services.intelligence.analytics import get_business_metrics, get_top_products
+from app.services.intelligence.insights import generate_insights
 
 router = APIRouter(prefix="/admin", tags=["admin-api"])
 
@@ -141,3 +143,15 @@ def admin_support(
         }
         for row in rows
     ]
+
+@router.get("/dashboard/{business_id}")
+def get_dashboard(business_id: str):
+    metrics = get_business_metrics(business_id)
+    top_products = get_top_products(business_id)
+    insights = generate_insights(business_id)
+
+    return {
+        "metrics": metrics,
+        "top_products": top_products,
+        "insights": insights
+    }

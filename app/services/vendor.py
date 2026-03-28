@@ -500,20 +500,45 @@ def create_support_ticket(
     order_id: Optional[str] = None,
     preferred_contact: Optional[str] = None,
 ) -> Dict[str, Any]:
+
+    category = "general"
+
+    issue_lower = issue.lower()
+
+    if any(x in issue_lower for x in ["late", "delay"]):
+        category = "delay"
+    elif any(x in issue_lower for x in ["wrong", "incorrect"]):
+        category = "wrong_item"
+    elif any(x in issue_lower for x in ["refund", "money"]):
+        category = "refund"
+
+    priority = "normal"
+    if category in ["wrong_item", "refund"]:
+        priority = "high"
+
     document = {
         "business_id": business_id,
         "ticket_id": generate_id("support"),
         "customer_phone": customer_phone,
         "order_id": order_id,
         "issue": issue.strip(),
-        "preferred_contact": preferred_contact.strip() if preferred_contact else None,
+        "category": category,
+        "priority": priority,
         "status": "open",
         "created_at": utc_now(),
         "updated_at": utc_now(),
     }
+
     get_collection("support_tickets").insert_one(document)
+
     _notify_vendor_support_ticket(document, business_id=business_id)
-    return {"ticket_id": document["ticket_id"], "issue": document["issue"], "status": document["status"]}
+
+    return {
+        "ticket_id": document["ticket_id"],
+        "category": category,
+        "priority": priority,
+        "status": document["status"],
+    }
 
 
 def create_promotion(

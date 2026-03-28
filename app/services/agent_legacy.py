@@ -1,10 +1,14 @@
 import json
 from typing import Any, Dict, List, Optional
 
+from click import style
+from datetime import datetime
+
+from app import db
 from app.db.mongo import DEFAULT_BUSINESS_ID
 from app.services.broadcast import execute_broadcast
-from app.services.llm import call_llm, detect_language_style, is_confirmation_no, is_confirmation_yes, safe_parse_json
-from app.services.order import build_order_preview, create_order, get_latest_order, get_latest_vendor_actionable_order, update_order_status
+from app.services.llm import detect_language_style, is_confirmation_no, is_confirmation_yes
+from app.services.order import build_order_preview, create_order, get_latest_order, get_latest_vendor_actionable_order, update_order_address, update_order_status
 from app.services.state import append_history, clear_pending_action, get_conversation_state, get_recent_history, set_pending_action, update_last_language
 from app.services.vendor import (
     add_product,
@@ -23,6 +27,7 @@ from app.services.vendor import (
     normalize_product_name,
     notify_customer_order_update,
     send_vendor_order_notification,
+    send_whatsapp_message,
     update_business_profile,
     update_product,
     update_product_offer,
@@ -46,6 +51,7 @@ TOOL_NAMES = {
     "create_event",
     "update_business_info",
     "send_broadcast",
+    "resolve_support_ticket",
 }
 VENDOR_ONLY_TOOLS = {
     "update_order_status",
@@ -57,97 +63,9 @@ VENDOR_ONLY_TOOLS = {
     "create_event",
     "update_business_info",
     "send_broadcast",
+    "resolve_support_ticket",
 }
 
-
-def process_incoming_message(message: str, user: Dict[str, str]) -> str:
-    business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
-    style = detect_language_style(message)
-    update_last_language(user["phone"], user["role"], style, message, business_id=business_id)
-    state = get_conversation_state(user["phone"], business_id=business_id)
-    history = get_recent_history(user["phone"], business_id=business_id, limit=10)
-
-    pending_reply = _handle_pending_action(message, user, style, state)
-    if pending_reply is not None:
-        _store_turn(user["phone"], message, pending_reply, business_id=business_id)
-        return pending_reply
-
-    reply = agent_loop(message=message, user=user, state=state, history=history)
-    _store_turn(user["phone"], message, reply, business_id=business_id)
-    return reply
-
-
-def agent_loop(message: str, user: Dict[str, str], state: Dict[str, Any], history: List[Dict[str, str]]) -> str:
-    style = state.get("lastLanguage") or detect_language_style(message)
-    response = _call_agent_llm(message=message, user=user, state=state, history=history, style=style)
-    print("LLM response:", response)
-    parsed = safe_parse_json(response)
-    print("Parsed tool:", parsed)
-
-    if not parsed or "message" not in parsed:
-        return _fallback_response(message, user, style, state)
-
-    action = parsed.get("action")
-    arguments = parsed.get("arguments", {}) if isinstance(parsed.get("arguments"), dict) else {}
-    if not action:
-        return str(parsed.get("message") or _fallback_response(message, user, style, state))
-    if action not in TOOL_NAMES:
-        return str(parsed.get("message") or _fallback_response(message, user, style, state))
-
-    validated = validate_and_fix_args(action, arguments, state, message, user)
-    result = execute_tool(action, validated, state, user, style, parsed.get("message", ""))
-    return result.get("message") or str(parsed.get("message") or "").strip() or _fallback_response(message, user, style, state)
-
-
-def _call_agent_llm(*, message: str, user: Dict[str, str], state: Dict[str, Any], history: List[Dict[str, str]], style: str) -> str:
-    system_prompt = f"""
-You are a smart WhatsApp sales assistant for a product business on WhatsApp.
-
-You behave like a human salesperson.
-
-You can:
-* greet naturally
-* suggest products
-* understand vague requests
-* answer questions about products, pricing, policies, delivery, support, and store details using the database
-* take multi-item orders
-* answer support questions
-* help vendors manage products, promotions, offers, events, business details, and broadcasts
-
-RULES:
-* Use tools when action is required
-* Use product and business tools to answer factual questions from the database
-* Do not invent products, policies, prices, or store details
-* Ask questions if information is missing
-* Allow users to add multiple items before checkout
-* Customers may browse with filters like category, price range, tags, budget, or sorting preferences
-* Customers may update a draft order by adding items, removing items, or changing quantities before checkout
-* Only ask for address when the user is ready to confirm
-* Handle support queries empathetically and use support tools when needed
-* Vendor product changes, promotions, offers, events, business details, and broadcasts should use tools
-
-You must always return JSON in this exact format:
-{{
-  "thought": "what you understood",
-  "action": "tool_name OR null",
-  "arguments": {{}},
-  "message": "final user-facing message"
-}}
-
-Current user role: {user["role"]}
-Preferred language style: {style}
-Current pending action: {json.dumps(state.get("pendingAction") or {}, ensure_ascii=False)}
-Available tools: {json.dumps(TOOL_DEFINITIONS, ensure_ascii=False)}
-""".strip()
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-10:])
-    messages.append({"role": "user", "content": message})
-    try:
-        return call_llm(messages, json_mode=True, temperature=0.1)
-    except Exception as exc:
-        print("LLM call failed:", str(exc))
-        return ""
 
 
 def _fallback_response(message: str, user: Dict[str, str], style: str, state: Dict[str, Any]) -> str:
@@ -181,6 +99,57 @@ def _fallback_response(message: str, user: Dict[str, str], style: str, state: Di
         return "Products, orders, support എന്നിവയിൽ ഞാൻ സഹായിക്കാം. കൂടുതൽ വിശദമായി പറയൂ."
     return "I can help with products, orders, and support. Tell me a bit more."
 
+def resolve_ticket(ticket_id: str, resolution: str):
+    from app.db.mongo import get_db
+
+    db = get_db()
+
+    result = db.support_tickets.update_one(
+        {"ticket_id": ticket_id},
+        {
+            "$set": {
+                "status": "resolved",
+                "resolution_notes": resolution,
+                "resolved_at": datetime.utcnow(),
+            }
+        }
+    )
+
+    return result.modified_count > 0
+
+def _tool_resolve_support_ticket(args: Dict[str, Any], user: Dict[str, str], state: Dict[str, Any]) -> Dict[str, str]:
+    ticket_id = args.get("ticket_id")
+    resolution = args.get("resolution", "Issue resolved")
+
+    if not ticket_id:
+        return {"status": "error", "message": "Missing ticket_id"}
+
+    ticket = db.support_tickets.find_one({"ticket_id": ticket_id})
+
+    if not ticket:
+        return {"status": "error", "message": f"Ticket {ticket_id} not found"}
+
+    db.support_tickets.update_one(
+        {"ticket_id": ticket_id},
+        {
+            "$set": {
+                "status": "resolved",
+                "resolution_notes": resolution,
+                "resolved_at": datetime.utcnow()
+            }
+        }
+    )
+
+    # Notify customer
+    send_whatsapp_message(
+        ticket["customer_phone"],
+        f"✅ Your issue has been resolved: {resolution}"
+    )
+
+    return {
+        "status": "success",
+        "message": f"Ticket {ticket_id} resolved successfully"
+    }
 
 def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, Any], message: str, user: Dict[str, str]) -> Dict[str, Any]:
     safe_args = dict(args or {})
@@ -281,6 +250,13 @@ def validate_and_fix_args(action: str, args: Dict[str, Any], state: Dict[str, An
             "order_id": str(safe_args.get("order_id") or safe_args.get("orderId") or "").strip().upper() or None,
             "preferred_contact": str(safe_args.get("preferred_contact") or "").strip() or None,
             "business_id": business_id,
+        }
+
+    if action == "resolve_support_ticket":
+        return {
+            "ticket_id": str(safe_args.get("ticket_id") or "").strip(),
+            "resolution": str(safe_args.get("resolution") or "").strip() or "Issue resolved",
+            "business_id": business_id
         }
 
     if action == "update_order_status":
@@ -409,6 +385,8 @@ def execute_tool(action: str, args: Dict[str, Any], state: Dict[str, Any], user:
     if action in VENDOR_ONLY_TOOLS and user.get("role") != "vendor":
         return {"message": "I can help you browse products, place orders, and get support here. Store management actions are only available to the vendor account."}
 
+    if action == "resolve_support_ticket":
+        return _tool_resolve_support_ticket(args, user, state)
     if action == "get_products":
         return _tool_get_products(args, style)
     if action == "get_product_details":
@@ -440,6 +418,7 @@ def execute_tool(action: str, args: Dict[str, Any], state: Dict[str, Any], user:
     if action == "send_broadcast":
         return _tool_send_broadcast(args, user, style)
     return {"message": llm_message or "Sorry, I didn’t get that. Can you rephrase?"}
+
 
 
 def _handle_pending_action(message: str, user: Dict[str, str], style: str, state: Dict[str, Any]) -> Optional[str]:
@@ -523,8 +502,26 @@ def _tool_create_order(args: Dict[str, Any], user: Dict[str, str], style: str) -
     if not items:
         return {"message": format_product_response(get_product_catalog(business_id=business_id), style, intro="I can help with these products:")}
     if not address:
-        save_pending_draft(user, "create_order", style, _summarize_items(items), {"items": items, "address": ""})
-        return {"message": _draft_message(items, style, operation=args.get("operation", "add"))}
+        save_pending_draft(
+            user,
+            "create_order",
+            style,
+            _summarize_items(items),
+            {"items": items, "address": ""}
+        )
+    if not args.get("address"):
+        return {
+            "status": "needs_input",
+            "missing": "address",
+            "message": "Please provide delivery address"
+        }
+
+    # 🚨 FORCE address collection (strong UX)
+    if style == "manglish":
+        return {"message": f"{_draft_message(items, style)}\n\n📍 Delivery address ayakkamo?"}
+    if style == "malayalam":
+        return {"message": f"{_draft_message(items, style)}\n\n📍 Delivery address അയക്കാമോ?"}
+
     _queue_confirmation(user, style, "create_order", {"items": items, "address": address}, address)
     return {"message": build_order_preview(items, address, style=style, business_id=business_id)["message"]}
 
@@ -636,6 +633,10 @@ def _tool_send_broadcast(args: Dict[str, Any], user: Dict[str, str], style: str)
 
 def _finalize_confirmed_order(arguments: Dict[str, Any], user: Dict[str, str], style: str) -> str:
     business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
+    if not arguments.get("address"):
+        return "❌ Cannot place order without delivery address."
+    if not arguments.get("address"):
+        return "❌ Delivery address missing. Please send your address to continue."
     order = create_order(business_id, user["phone"], arguments.get("items", []), arguments.get("address", ""))
     print("ORDER CREATED:", order.model_dump())
     vendor_notified = send_vendor_order_notification(order, business_id=business_id)
@@ -715,6 +716,7 @@ def save_pending_draft(user: Dict[str, str], tool_name: str, style: str, last_me
     set_pending_action(user["phone"], business_id=user.get("business_id") or DEFAULT_BUSINESS_ID, role=user["role"], action_type="draft_tool", data={"tool": tool_name, "data": partial_data}, last_language=style, last_message=last_message)
 
 
+
 def _handle_order_draft_progress(message: str, user: Dict[str, str], style: str, state: Dict[str, Any]) -> Optional[str]:
     business_id = user.get("business_id") or DEFAULT_BUSINESS_ID
     draft = _get_draft_data(state)
@@ -728,7 +730,20 @@ def _handle_order_draft_progress(message: str, user: Dict[str, str], style: str,
 
     if is_address(stripped):
         address = stripped
-        _queue_confirmation(user, style, "create_order", {"items": items, "address": address}, address)
+
+        # 🔥 NEW: persist address immediately
+        latest_order = get_latest_order(user["phone"], business_id=business_id)
+        if latest_order and not latest_order.address:
+            update_order_address(latest_order.orderId, address, business_id)
+
+        _queue_confirmation(
+            user,
+            style,
+            "create_order",
+            {"items": items, "address": address},
+            address
+        )
+
         return build_order_preview(items, address, style=style, business_id=business_id)["message"]
 
     extracted = _extract_basic_items(stripped, business_id=business_id)
@@ -955,15 +970,18 @@ def _extract_basic_items(message: str, business_id: str = DEFAULT_BUSINESS_ID) -
     return items
 
 
-def _infer_vendor_status(message: str) -> Optional[str]:
-    if any(token in message for token in ["reject", "rejected"]):
-        return "rejected"
-    if "deliver" in message:
-        return "delivered"
-    if "dispatch" in message or "out for delivery" in message:
-        return "out_for_delivery"
-    if any(token in message for token in ["accept", "accepted", "ok", "okay"]):
+def _infer_vendor_status(msg: str):
+    msg = msg.lower()
+
+    if any(x in msg for x in ["accept", "ok", "yes"]):
         return "accepted"
+
+    if any(x in msg for x in ["dispatch", "sending", "out"]):
+        return "out_for_delivery"
+
+    if any(x in msg for x in ["deliver", "done", "completed"]):
+        return "delivered"
+
     return None
 
 
@@ -1122,6 +1140,10 @@ TOOL_DEFINITIONS = [
     {"name": "create_event", "description": "Create a business event with optional discount metadata and optional broadcast text."},
     {"name": "update_business_info", "description": "Update business profile details such as store name, type, description, address, hours, contact phone, support details, policies, delivery info, and broadcast groups."},
     {"name": "send_broadcast", "description": "Send a marketing broadcast to known customers and configured WhatsApp groups."},
+    {
+    "name": "resolve_support_ticket",
+    "description": "Resolve a support ticket with a resolution message and update its status to resolved."
+    },
 ]
 
 

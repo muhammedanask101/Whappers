@@ -13,21 +13,23 @@ async function apiFetch(path, token, options = {}) {
       ...(options.headers || {})
     }
   });
+
   if (!response.ok) {
     throw new Error(`API request failed: ${response.status}`);
   }
+
   return response.json();
 }
 
 export default function DashboardPage() {
   const [token, setToken] = useState("");
   const [savedToken, setSavedToken] = useState("");
+
   const [businesses, setBusinesses] = useState([]);
-  const [orders, setOrders] = useState([]);
-  const [usage, setUsage] = useState(null);
-  const [support, setSupport] = useState([]);
   const [selectedBusiness, setSelectedBusiness] = useState("");
-  const [businessForm, setBusinessForm] = useState({ name: "", whatsapp_number: "", vendor_phone: "", business_type: "retail" });
+
+  const [dashboard, setDashboard] = useState(null);
+  const [orders, setOrders] = useState([]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("admin_token") || "";
@@ -35,61 +37,47 @@ export default function DashboardPage() {
     setSavedToken(stored);
   }, []);
 
+  // Load businesses
   useEffect(() => {
     if (!savedToken) return;
-    Promise.all([
-      apiFetch("/admin/businesses", savedToken),
-      apiFetch("/admin/orders", savedToken),
-      apiFetch("/admin/usage", savedToken),
-      apiFetch("/admin/support", savedToken)
-    ]).then(([biz, ord, use, sup]) => {
-      setBusinesses(biz);
-      setOrders(ord);
-      setUsage(use);
-      setSupport(sup);
-      if (!selectedBusiness && biz[0]) setSelectedBusiness(biz[0].business_id);
-    }).catch(() => {
-      setBusinesses([]);
-      setOrders([]);
-      setUsage(null);
-      setSupport([]);
-    });
+
+    apiFetch("/admin/businesses", savedToken)
+      .then((biz) => {
+        setBusinesses(biz);
+        if (!selectedBusiness && biz[0]) {
+          setSelectedBusiness(biz[0].business_id);
+        }
+      })
+      .catch(() => setBusinesses([]));
   }, [savedToken]);
 
+  // Load dashboard data
+  useEffect(() => {
+    if (!savedToken || !selectedBusiness) return;
+
+    Promise.all([
+      apiFetch(`/admin/dashboard/${selectedBusiness}`, savedToken),
+      apiFetch("/admin/orders", savedToken)
+    ])
+      .then(([dash, ord]) => {
+        setDashboard(dash);
+        setOrders(ord);
+      })
+      .catch(() => {
+        setDashboard(null);
+        setOrders([]);
+      });
+  }, [savedToken, selectedBusiness]);
+
   const selectedOrders = useMemo(
-    () => orders.filter((order) => !selectedBusiness || order.business_id === selectedBusiness),
+    () => orders.filter((o) => o.business_id === selectedBusiness),
     [orders, selectedBusiness]
   );
 
-  const selectedSupport = useMemo(
-    () => support.filter((ticket) => !selectedBusiness || ticket.business_id === selectedBusiness),
-    [support, selectedBusiness]
-  );
-
-  async function handleLogin(event) {
-    event.preventDefault();
+  function handleLogin(e) {
+    e.preventDefault();
     window.localStorage.setItem("admin_token", token);
     setSavedToken(token);
-  }
-
-  async function handleCreateBusiness(event) {
-    event.preventDefault();
-    const created = await apiFetch("/admin/business", savedToken, {
-      method: "POST",
-      body: JSON.stringify(businessForm)
-    });
-    setBusinesses((current) => [...current, created]);
-    setSelectedBusiness(created.business_id);
-    setBusinessForm({ name: "", whatsapp_number: "", vendor_phone: "", business_type: "retail" });
-  }
-
-  async function handleDeleteBusiness() {
-    if (!selectedBusiness) return;
-    if (!window.confirm("Delete this business?")) return;
-    await apiFetch(`/admin/business/${selectedBusiness}`, savedToken, { method: "DELETE" });
-    const nextBusinesses = businesses.filter((business) => business.business_id !== selectedBusiness);
-    setBusinesses(nextBusinesses);
-    setSelectedBusiness(nextBusinesses[0]?.business_id || "");
   }
 
   if (!savedToken) {
@@ -97,9 +85,13 @@ export default function DashboardPage() {
       <main style={styles.center}>
         <form onSubmit={handleLogin} style={styles.card}>
           <h1>Super Admin</h1>
-          <p>Connect this dashboard to your FastAPI backend with the admin token.</p>
-          <input value={token} onChange={(e) => setToken(e.target.value)} placeholder="Admin token" style={styles.input} />
-          <button type="submit" style={styles.button}>Continue</button>
+          <input
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Admin token"
+            style={styles.input}
+          />
+          <button style={styles.button}>Continue</button>
         </form>
       </main>
     );
@@ -107,51 +99,67 @@ export default function DashboardPage() {
 
   return (
     <main style={styles.shell}>
+      {/* Sidebar */}
       <section style={styles.sidebar}>
         <h2>Businesses</h2>
-        <div style={{ display: "grid", gap: 10 }}>
-          {businesses.map((business) => (
-            <button key={business.business_id} onClick={() => setSelectedBusiness(business.business_id)} style={{ ...styles.businessButton, borderColor: selectedBusiness === business.business_id ? "#1d2328" : "#d8d0c7" }}>
-              <strong>{business.name}</strong>
-              <span>{business.whatsapp_number}</span>
-            </button>
+
+        {businesses.map((b) => (
+          <button
+            key={b.business_id}
+            onClick={() => setSelectedBusiness(b.business_id)}
+            style={{
+              ...styles.businessButton,
+              borderColor:
+                selectedBusiness === b.business_id ? "#000" : "#ddd"
+            }}
+          >
+            <strong>{b.name}</strong>
+            <span>{b.whatsapp_number}</span>
+          </button>
+        ))}
+      </section>
+
+      {/* Main */}
+      <section style={styles.main}>
+        <h1>AI Sales Dashboard</h1>
+
+        {/* Metrics */}
+        <div style={styles.metrics}>
+          <Metric label="Revenue" value={dashboard?.metrics?.total_revenue ?? 0} />
+          <Metric label="Orders" value={dashboard?.metrics?.total_orders ?? 0} />
+          <Metric label="Customers" value={dashboard?.metrics?.total_customers ?? 0} />
+          <Metric label="Avg Order" value={dashboard?.metrics?.avg_order_value ?? 0} />
+        </div>
+
+        {/* Insights */}
+        <div style={styles.panel}>
+          <h2>🧠 AI Insights</h2>
+          {dashboard?.insights?.length === 0 && <p>No insights yet</p>}
+          {dashboard?.insights?.map((i, idx) => (
+            <div key={idx} style={styles.insight}>
+              {i.message}
+            </div>
           ))}
         </div>
-        <form onSubmit={handleCreateBusiness} style={{ display: "grid", gap: 10, marginTop: 20 }}>
-          <h3>Create Business</h3>
-          <input style={styles.input} placeholder="Name" value={businessForm.name} onChange={(e) => setBusinessForm({ ...businessForm, name: e.target.value })} />
-          <input style={styles.input} placeholder="WhatsApp number" value={businessForm.whatsapp_number} onChange={(e) => setBusinessForm({ ...businessForm, whatsapp_number: e.target.value })} />
-          <input style={styles.input} placeholder="Vendor phone" value={businessForm.vendor_phone} onChange={(e) => setBusinessForm({ ...businessForm, vendor_phone: e.target.value })} />
-          <input style={styles.input} placeholder="Type" value={businessForm.business_type} onChange={(e) => setBusinessForm({ ...businessForm, business_type: e.target.value })} />
-          <button type="submit" style={styles.button}>Create</button>
-        </form>
-      </section>
-      <section style={styles.main}>
-        <h1>AI Commerce Platform</h1>
-        <p>Backend: {apiBase}</p>
-        <div style={styles.metrics}>
-          <Metric label="Messages" value={usage?.messages ?? 0} />
-          <Metric label="Orders" value={usage?.orders ?? 0} />
-          <Metric label="Customers" value={usage?.customers ?? 0} />
-          <Metric label="Support" value={usage?.support_tickets ?? 0} />
+
+        {/* Top Products */}
+        <div style={styles.panel}>
+          <h2>🔥 Top Products</h2>
+          {dashboard?.top_products?.map((p, idx) => (
+            <div key={idx} style={styles.row}>
+              <span>{p.name}</span>
+              <strong>{p.quantity}</strong>
+            </div>
+          ))}
         </div>
-        <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <button
-            type="button"
-            style={{ ...styles.button, background: businesses.length > 1 ? "#9a3412" : "#9b9b9b" }}
-            disabled={businesses.length <= 1 || !selectedBusiness}
-            onClick={handleDeleteBusiness}
-          >
-            Delete Selected Business
-          </button>
-        </div>
+
+        {/* Orders */}
         <div style={styles.panel}>
           <h2>Orders</h2>
-          <Table rows={selectedOrders} columns={["business_id", "order_id", "customer_phone", "status", "total"]} />
-        </div>
-        <div style={styles.panel}>
-          <h2>Support Tickets</h2>
-          <Table rows={selectedSupport} columns={["business_id", "ticket_id", "customer_phone", "issue", "status"]} />
+          <Table
+            rows={selectedOrders}
+            columns={["order_id", "customer_phone", "status", "total"]}
+          />
         </div>
       </section>
     </main>
@@ -169,35 +177,39 @@ function Metric({ label, value }) {
 
 function Table({ rows, columns }) {
   return (
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead>
-          <tr>{columns.map((column) => <th key={column} style={styles.th}>{column}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.map((row, index) => (
-            <tr key={`${index}-${row[columns[0]]}`}>
-              {columns.map((column) => <td key={column} style={styles.td}>{String(row[column] ?? "")}</td>)}
-            </tr>
+    <table style={{ width: "100%" }}>
+      <thead>
+        <tr>
+          {columns.map((c) => (
+            <th key={c}>{c}</th>
           ))}
-        </tbody>
-      </table>
-    </div>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r, i) => (
+          <tr key={i}>
+            {columns.map((c) => (
+              <td key={c}>{r[c]}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
 const styles = {
   center: { minHeight: "100vh", display: "grid", placeItems: "center" },
-  shell: { display: "grid", gridTemplateColumns: "320px 1fr", minHeight: "100vh" },
-  sidebar: { padding: 24, borderRight: "1px solid #d8d0c7", background: "#fcfaf6" },
-  main: { padding: 24, display: "grid", gap: 18 },
-  card: { width: "min(420px, 92vw)", background: "#fff", padding: 24, borderRadius: 16, border: "1px solid #d8d0c7", display: "grid", gap: 12 },
-  panel: { background: "#fff", borderRadius: 16, border: "1px solid #d8d0c7", padding: 18 },
-  metrics: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 },
-  metric: { background: "#fff", borderRadius: 16, border: "1px solid #d8d0c7", padding: 18, display: "grid", gap: 8 },
-  input: { padding: 10, borderRadius: 10, border: "1px solid #cfc6bb", width: "100%" },
-  button: { padding: 10, borderRadius: 10, border: 0, background: "#1d2328", color: "#fff" },
-  businessButton: { display: "grid", gap: 4, textAlign: "left", padding: 12, borderRadius: 12, background: "#fff", border: "1px solid #d8d0c7" },
-  th: { textAlign: "left", borderBottom: "1px solid #d8d0c7", padding: "10px 8px" },
-  td: { borderBottom: "1px solid #eee7dd", padding: "10px 8px" }
+  shell: { display: "grid", gridTemplateColumns: "300px 1fr", minHeight: "100vh" },
+  sidebar: { padding: 20, borderRight: "1px solid #ddd" },
+  main: { padding: 20, display: "grid", gap: 20 },
+  card: { padding: 20, border: "1px solid #ddd", borderRadius: 10 },
+  metrics: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10 },
+  metric: { padding: 15, border: "1px solid #ddd", borderRadius: 10 },
+  panel: { padding: 20, border: "1px solid #ddd", borderRadius: 10 },
+  input: { padding: 10, border: "1px solid #ccc", borderRadius: 8 },
+  button: { padding: 10, background: "#111", color: "#fff", borderRadius: 8 },
+  businessButton: { padding: 10, marginBottom: 10, border: "1px solid #ddd", borderRadius: 8 },
+  insight: { padding: 10, background: "#fff3cd", marginBottom: 8, borderRadius: 6 },
+  row: { display: "flex", justifyContent: "space-between", padding: 8 }
 };

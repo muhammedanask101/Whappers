@@ -6,6 +6,8 @@ from pymongo import ReturnDocument
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 from app.models.order import OrderItem, OrderRecord
 from app.services.vendor import get_pricing_adjustments, get_product_catalog_map, normalize_product_name
+from app.services.intelligence.customer_profile import update_customer_profile
+from app.services.intelligence.events import trigger_event
 
 
 def create_order(business_id: str, customer_phone: str, items: List[Dict[str, Any]], address: str) -> OrderRecord:
@@ -21,6 +23,14 @@ def create_order(business_id: str, customer_phone: str, items: List[Dict[str, An
         address=address,
         createdAt=now.isoformat(),
     )
+
+    update_customer_profile(customer_phone, business_id, order.model_dump())
+
+    trigger_event("order_created", {
+        "phone": customer_phone,
+        "business_id": business_id
+    })
+
     get_collection("orders").insert_one(
         {
             "business_id": business_id,
@@ -38,12 +48,34 @@ def create_order(business_id: str, customer_phone: str, items: List[Dict[str, An
     return order
 
 
+VALID_TRANSITIONS = {
+    "pending": ["accepted", "rejected"],
+    "accepted": ["out_for_delivery"],
+    "out_for_delivery": ["delivered"],
+}
+
+
 def update_order_status(order_id: str, status: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[OrderRecord]:
+    current = get_collection("orders").find_one(
+        {"business_id": business_id, "order_id": order_id}
+    )
+
+    if not current:
+        return None
+
+    current_status = current.get("status")
+
+    # 🔥 Enforce lifecycle
+    allowed = VALID_TRANSITIONS.get(current_status, [])
+    if status not in allowed:
+        return None  # ❌ block invalid transitions
+
     document = get_collection("orders").find_one_and_update(
         {"business_id": business_id, "order_id": order_id},
         {"$set": {"status": status, "updated_at": utc_now()}},
         return_document=ReturnDocument.AFTER,
     )
+
     return _doc_to_order(document) if document else None
 
 
@@ -186,3 +218,17 @@ def _doc_to_order(document: Dict[str, Any]) -> OrderRecord:
         address=document["address"],
         createdAt=document["created_at"].isoformat() if hasattr(document.get("created_at"), "isoformat") else str(document["created_at"]),
     )
+
+
+def update_order_address(order_id: str, address: str, business_id: str):
+    from app.db.mongo import get_orders_collection
+
+    orders = get_orders_collection()
+
+    result = orders.find_one_and_update(
+        {"orderId": order_id, "business_id": business_id},
+        {"$set": {"address": address}},
+        return_document=True
+    )
+
+    return result
