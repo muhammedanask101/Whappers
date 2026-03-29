@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List
 
 from app.services.agent.learning import learned_token_weights, tokenize
@@ -7,13 +8,30 @@ from app.services.agent.tools import vendor_status_candidates
 
 
 INTENT_PRIORS = {
+    "general": {"hi", "hello", "hey", "hii", "yo", "hola", "greetings"},
     "support": {"refund", "issue", "problem", "wrong", "complaint", "late", "delay", "help", "damaged"},
-    "order_status": {"status", "track", "where", "delivery", "arrive", "order"},
-    "cart": {"buy", "want", "need", "add", "cart", "take", "pack", "piece", "quantity"},
+    "order_status": {"status", "track", "where", "delivery", "arrive", "shipped", "pending", "delivered"},
+    "cart": {"buy", "want", "need", "add", "cart", "take", "pack", "piece", "quantity", "order"},
     "checkout": {"checkout", "place", "confirm", "address", "deliver", "ship", "send"},
-    "browse": {"show", "available", "options", "catalog", "menu", "products", "suggest"},
+    "browse": {"show", "available", "options", "catalog", "menu", "products", "suggest", "new", "make", "start"},
     "vendor_ops": {"product", "stock", "offer", "promotion", "broadcast", "business", "update"},
 }
+
+CORRECTION_PHRASES = {
+    "not my address",
+    "wrong address",
+    "not the address",
+    "that is not my address",
+    "thats not my address",
+    "that's not my address",
+    "wrong",
+    "incorrect",
+    "change address",
+    "update address",
+    "not that",
+}
+
+ACKNOWLEDGEMENT_TOKENS = {"yeah", "yes", "ok", "okay", "show", "it", "bill", "fine", "sure", "hmm"}
 
 
 def analyze_message(
@@ -41,18 +59,47 @@ def analyze_message(
         status_options = []
 
     workflow = state.get("workflow", {})
+    correction = _is_correction(lowered)
+    probable_address = _looks_like_address(message)
     if workflow.get("stage") == "collect_address":
         scores["checkout"] += 0.24
+        if correction:
+            scores["checkout"] += 0.25
     if workflow.get("stage") == "ready_to_checkout" and lowered in {"yes", "ok", "okay", "confirm", "place", "proceed"}:
         scores["checkout"] += 0.8
+    if "new order" in lowered or "make a new order" in lowered or "place an order" in lowered:
+        scores["cart"] += 0.55
+        scores["browse"] += 0.2
+        scores["order_status"] -= 0.2
     if any(char.isdigit() for char in lowered):
         scores["cart"] += 0.14
     if "address" in lowered:
         scores["checkout"] += 0.22
+    if lowered in {"hi", "hello", "hey", "hey there", "hey theree", "hii"}:
+        scores["general"] += 0.9
+    if _is_stretched_greeting(lowered):
+        scores["general"] += 0.9
+    if _looks_like_browse_request(lowered, tokens):
+        scores["browse"] += 0.82
+        scores["general"] -= 0.12
+        if "show" in tokens or "see" in tokens or "all" in tokens:
+            scores["cart"] -= 0.16
+    if "all the products" in lowered or "see all the products" in lowered or "see what you have" in lowered:
+        scores["browse"] += 0.45
+        scores["cart"] -= 0.2
+    active_goal = str((state.get("goal_tracking") or {}).get("goal_type") or "").strip()
+    if active_goal == "browse" and not workflow.get("name"):
+        if intent_like_browse := _looks_like_browse_request(lowered, tokens):
+            scores["browse"] += 0.22
+        elif len(tokens) <= 4 and not correction:
+            scores["browse"] += 0.08
 
     ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     intent, confidence = ordered[0]
     runner_up = ordered[1][1] if len(ordered) > 1 else 0.0
+    if confidence <= 0.12:
+        intent = "general"
+        runner_up = ordered[0][1] if ordered else 0.0
     uncertainty = max(0.0, 0.62 - (confidence - runner_up))
 
     return {
@@ -63,8 +110,10 @@ def analyze_message(
         "tokens": tokens,
         "signals": ordered,
         "vendor_status_options": status_options,
+        "is_correction": correction,
+        "probable_address": probable_address,
         "complexity": _complexity(message, state, user, status_options),
-        "needs_llm": _needs_llm(message, state, user, confidence, runner_up, status_options),
+        "needs_llm": _needs_llm(message, state, user, confidence, runner_up, status_options, probable_address, correction),
     }
 
 
@@ -105,6 +154,8 @@ def build_strategy(
         strategy["goal"] = "complete_order_or_status_request"
         if cart_size == 0:
             strategy["upsell_allowed"] = False
+    elif analysis.get("intent") == "general":
+        strategy["goal"] = "engage_and_discover_need"
     else:
         strategy["goal"] = "increase_conversion_without_friction"
 
@@ -112,6 +163,8 @@ def build_strategy(
 
 
 def select_cost_tier(analysis: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any]) -> str:
+    if analysis.get("intent") in {"general", "browse"} and not (state.get("goal_tracking") or {}).get("current_plan") and not state.get("workflow", {}).get("name"):
+        return "cheap"
     if analysis.get("complexity") in {"high", "multi_step"}:
         return "smart"
     if (state.get("goal_tracking") or {}).get("current_plan"):
@@ -126,9 +179,13 @@ def select_cost_tier(analysis: Dict[str, Any], state: Dict[str, Any], user: Dict
 def cheap_action_allowed(analysis: Dict[str, Any], user: Dict[str, Any], state: Dict[str, Any]) -> bool:
     if (state.get("goal_tracking") or {}).get("current_plan"):
         return False
+    if analysis.get("intent") == "general" and analysis.get("confidence", 0.0) >= 0.14 and not state.get("workflow", {}).get("name"):
+        return True
+    if analysis.get("intent") == "browse" and analysis.get("confidence", 0.0) >= 0.34 and not state.get("workflow", {}).get("name"):
+        return True
     if user.get("role") == "vendor" and analysis.get("vendor_status_options") and analysis["vendor_status_options"][0]["score"] >= 1.4:
         return True
-    if state.get("workflow", {}).get("stage") == "collect_address" and len(analysis.get("tokens", [])) >= 3 and analysis.get("intent") == "checkout":
+    if state.get("workflow", {}).get("stage") == "collect_address" and analysis.get("intent") == "checkout" and analysis.get("probable_address") and not analysis.get("is_correction"):
         return True
     if state.get("workflow", {}).get("stage") == "ready_to_checkout" and analysis.get("intent") == "checkout" and analysis.get("confidence", 0.0) >= 0.75:
         return True
@@ -142,10 +199,14 @@ def _needs_llm(
     confidence: float,
     runner_up: float,
     status_options: List[Dict[str, Any]],
+    probable_address: bool,
+    correction: bool,
 ) -> bool:
     if user.get("role") == "vendor" and status_options and status_options[0]["score"] >= 1.4:
         return False
-    if state.get("workflow", {}).get("stage") == "collect_address" and len(message.split()) >= 3:
+    if correction:
+        return True
+    if state.get("workflow", {}).get("stage") == "collect_address" and probable_address:
         return False
     if state.get("workflow", {}).get("stage") == "ready_to_checkout" and message.strip().lower() in {"yes", "ok", "okay", "confirm", "place", "proceed"}:
         return False
@@ -170,3 +231,57 @@ def _category_for_intent(intent: str) -> str:
     if intent in {"order_status", "checkout", "cart"}:
         return "order"
     return "sales"
+
+
+def _is_correction(lowered: str) -> bool:
+    return any(phrase in lowered for phrase in CORRECTION_PHRASES)
+
+
+def _looks_like_address(message: str) -> bool:
+    lowered = message.lower().strip()
+    if not lowered:
+        return False
+    if _is_correction(lowered):
+        return False
+    tokens = [token for token in lowered.replace(",", " ").split() if token]
+    if len(tokens) < 4:
+        return False
+    if len(tokens) <= 5 and sum(1 for token in tokens if token in ACKNOWLEDGEMENT_TOKENS) >= 2:
+        return False
+    address_keywords = {"road", "rd", "street", "st", "lane", "house", "building", "floor", "flat", "near", "pin", "city", "district", "post", "po", "junction"}
+    has_keyword = any(token in address_keywords for token in tokens)
+    has_number = any(any(ch.isdigit() for ch in token) for token in tokens)
+    has_separator = "," in message or "-" in message or "/" in message
+    return has_keyword or (has_number and (has_separator or len(tokens) >= 5))
+
+
+def _is_stretched_greeting(lowered: str) -> bool:
+    return bool(re.fullmatch(r"(h+i+|he+y+|hey+y+|hello+)", lowered))
+
+
+def _looks_like_browse_request(lowered: str, tokens: List[str]) -> bool:
+    if not lowered:
+        return False
+    phrases = {
+        "what products do you have",
+        "what do you have",
+        "what all do you have",
+        "show products",
+        "show me products",
+        "show me what you have",
+        "i want to see all the products",
+        "i want to see the products",
+        "show all products",
+        "see all the products",
+        "available products",
+        "product list",
+        "catalog",
+        "menu",
+    }
+    if lowered in phrases:
+        return True
+    if "products" in tokens and any(word in tokens for word in {"show", "see", "available", "all"}):
+        return True
+    if "what do you have" in lowered or "products do you have" in lowered:
+        return True
+    return False

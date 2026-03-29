@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from typing import Any, Dict, List
 
 
@@ -48,7 +49,7 @@ def build_planner_messages(
     context = {
         "role": "user",
         "content": json.dumps(
-            {
+            _json_ready({
                 "user": {
                     "role": user.get("role"),
                     "phone": user.get("phone"),
@@ -62,7 +63,7 @@ def build_planner_messages(
                 "scratchpad": scratchpad,
                 "latest_user_message": user_message,
                 "requested_style": memory.get("style", "english"),
-            },
+            }),
             ensure_ascii=False,
         ),
     }
@@ -108,3 +109,20 @@ def summarize_memory_payload(
         },
         "history": compact_history,
     }
+
+
+def _json_ready(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(item) for item in value]
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)

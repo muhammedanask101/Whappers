@@ -10,7 +10,7 @@ def validate_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str]:
     if action == "respond":
         return True, ""
 
-    if action in {"inspect_customer_context", "inspect_order_context", "inspect_support_context", "inspect_business_context"}:
+    if action in {"inspect_customer_context", "inspect_order_context", "inspect_support_context", "inspect_business_context", "inspect_memory_context"}:
         return True, ""
 
     if action == "manage_cart":
@@ -22,6 +22,9 @@ def validate_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str]:
     if action == "collect_address":
         if "address" in args and not isinstance(args.get("address"), str):
             return False, "collect_address.address must be a string"
+        return True, ""
+
+    if action == "repair_order_context":
         return True, ""
 
     if action in {"checkout_order", "search_catalog", "get_product_details", "get_order_status"}:

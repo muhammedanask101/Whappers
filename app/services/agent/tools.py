@@ -66,6 +66,7 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "inspect_support_context": {"description": "Inspect open tickets, service history, and recovery context.", "roles": {"customer", "vendor"}, "domains": {"support"}, "internal": True, "base_score": 0.82},
     "inspect_business_context": {"description": "Inspect business profile, policies, promotions, and delivery context.", "roles": {"customer", "vendor"}, "domains": {"sales", "order", "support"}, "internal": True, "base_score": 0.55},
     "inspect_memory_context": {"description": "Retrieve relevant semantic memories, prior preferences, and past resolutions.", "roles": {"customer", "vendor"}, "domains": {"sales", "order", "support"}, "internal": True, "base_score": 0.7},
+    "repair_order_context": {"description": "Repair an active order flow after a correction, especially wrong address capture or slot confusion.", "roles": {"customer"}, "domains": {"order", "support"}, "internal": False, "base_score": 0.88},
     "search_catalog": {"description": "Semantic product search with personalization and ranking.", "roles": {"customer", "vendor"}, "domains": {"sales", "order"}, "internal": False, "base_score": 0.8},
     "get_product_details": {"description": "Get rich details for one product.", "roles": {"customer", "vendor"}, "domains": {"sales", "order"}, "internal": False, "base_score": 0.72},
     "manage_cart": {"description": "Add, remove, replace, or view cart items using semantic and learned matching.", "roles": {"customer"}, "domains": {"order", "sales"}, "internal": False, "base_score": 0.92},
@@ -141,8 +142,14 @@ def rank_tools(
             score += 0.24
         if analysis.get("intent") == "cart" and name in {"inspect_order_context", "manage_cart"}:
             score += 0.26
-        if analysis.get("intent") == "checkout" and name in {"inspect_order_context", "collect_address", "checkout_order"}:
+        if analysis.get("intent") == "checkout" and name in {"inspect_order_context", "collect_address", "checkout_order", "repair_order_context"}:
             score += 0.26
+        if analysis.get("is_correction") and name in {"repair_order_context", "inspect_order_context", "collect_address"}:
+            score += 0.3
+        if name == "repair_order_context" and not analysis.get("is_correction"):
+            score -= 0.5
+        if name == "repair_order_context" and state.get("workflow", {}).get("name") != "order_checkout":
+            score -= 0.3
         if analysis.get("intent") == "order_status" and name in {"inspect_order_context", "get_order_status"}:
             score += 0.26
         if analysis.get("intent") == "browse" and name in {"inspect_customer_context", "search_catalog", "recommend_products"}:
@@ -173,6 +180,7 @@ def execute_tool(
         "inspect_support_context": _tool_inspect_support_context,
         "inspect_business_context": _tool_inspect_business_context,
         "inspect_memory_context": _tool_inspect_memory_context,
+        "repair_order_context": _tool_repair_order_context,
         "search_catalog": _tool_search_catalog,
         "get_product_details": _tool_get_product_details,
         "manage_cart": _tool_manage_cart,
@@ -702,3 +710,133 @@ def vendor_status_candidates(message: str, business_id: str, learning_profile: O
     ranked = [{"status": status, "score": round(score, 3)} for status, score in scores.items() if score > 0]
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
+
+
+def _looks_like_address(message: str) -> bool:
+    lowered = str(message or "").lower().strip()
+    if not lowered:
+        return False
+    if any(phrase in lowered for phrase in {"not my address", "wrong address", "change address", "that's not my address", "thats not my address"}):
+        return False
+    tokens = [token for token in lowered.replace(",", " ").split() if token]
+    if len(tokens) < 4:
+        return False
+    acknowledgment = {"yeah", "yes", "ok", "okay", "show", "it", "bill", "sure", "fine"}
+    if len(tokens) <= 5 and sum(1 for token in tokens if token in acknowledgment) >= 2:
+        return False
+    address_keywords = {"road", "rd", "street", "st", "lane", "house", "building", "floor", "flat", "near", "pin", "city", "district", "post", "po", "junction"}
+    has_keyword = any(token in address_keywords for token in tokens)
+    has_number = any(any(ch.isdigit() for ch in token) for token in tokens)
+    punctuation = any(symbol in lowered for symbol in {",", "-", "/"})
+    return has_keyword or (has_number and (punctuation or len(tokens) >= 5))
+
+
+def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    cart = dict(state.get("cart") or {"items": [], "address": ""})
+    address = str(args.get("address") or args.get("raw_message") or "").strip()
+    if not _looks_like_address(address):
+        return ToolObservation(
+            tool="collect_address",
+            ok=False,
+            message="",
+            error=style_text(style, "That doesn't look like a full delivery address yet. Please send the house/building, area, and landmark or PIN.", "Ithu full delivery address pole thonnunnilla. House/building, area, landmark allenkil PIN ayakku.", "ഇത് പൂർണ്ണമായ ഡെലിവറി വിലാസമായി തോന്നുന്നില്ല. വീട്/ബിൽഡിംഗ്, ഏരിയ, ലാൻഡ്മാർക്ക് അല്ലെങ്കിൽ പിൻ അയയ്ക്കൂ."),
+        )
+    cart["address"] = address
+    cart["updated_at"] = utc_now().isoformat()
+    items = cart.get("items", [])
+    state_patch = {
+        "cart": cart,
+        "workflow": {
+            "name": "order_checkout" if items else "",
+            "stage": "ready_to_checkout" if items else "idle",
+            "required_slots": ["items", "address"] if items else [],
+            "filled_slots": {"items": bool(items), "address": True},
+            "next_question": "" if items else "Tell me what you'd like to order.",
+        },
+    }
+    message = style_text(style, "Address noted.", "Address note cheythu.", "വിലാസം രേഖപ്പെടുത്തി.")
+    if items:
+        preview = build_order_preview(items, address, style=style, business_id=user.get("business_id", DEFAULT_BUSINESS_ID))
+        message = preview["message"]
+    return ToolObservation(tool="collect_address", ok=True, message=message, data={"address": address, "items": items}, state_patch=state_patch)
+
+
+def _tool_repair_order_context(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    cart = dict(state.get("cart") or {"items": [], "address": ""})
+    raw_message = str(args.get("raw_message") or "").strip()
+    lowered = raw_message.lower()
+    if any(phrase in lowered for phrase in {"address", "wrong", "change", "not my address", "thats not", "that's not"}):
+        return ToolObservation(
+            tool="repair_order_context",
+            ok=True,
+            message=ask_address_text(style),
+            data={"recovery_signal": True, "products": [item.get("name", "") for item in cart.get("items", [])]},
+            state_patch={
+                "cart": {"items": cart.get("items", []), "address": "", "updated_at": utc_now().isoformat()},
+                "workflow": {
+                    "name": "order_checkout" if cart.get("items") else "",
+                    "stage": "collect_address" if cart.get("items") else "",
+                    "required_slots": ["items", "address"] if cart.get("items") else [],
+                    "filled_slots": {"items": bool(cart.get("items")), "address": False},
+                    "next_question": "Please share your correct delivery address." if cart.get("items") else "",
+                },
+            },
+        )
+    return ToolObservation(
+        tool="repair_order_context",
+        ok=True,
+        message=style_text(style, "I understood that as a correction. Tell me what should be fixed in the order.", "Ithu correction aanu ennu manassilayi. Order-il entha fix cheyyendathu parayu.", "ഇത് ഒരു തിരുത്തലാണെന്ന് മനസ്സിലായി. ഓർഡറിൽ എന്ത് ശരിയാക്കണമെന്ന് പറയൂ."),
+        data={"recovery_signal": True, "products": [item.get("name", "") for item in cart.get("items", [])]},
+        state_patch={"workflow": {"name": "order_checkout" if cart.get("items") else "", "stage": "collect_address" if cart.get("items") else "", "required_slots": ["items", "address"] if cart.get("items") else [], "filled_slots": {"items": bool(cart.get("items")), "address": bool(cart.get("address"))}, "next_question": "Clarify what should be corrected."}},
+    )
+
+
+def _is_generic_browse_query(query: str) -> bool:
+    lowered = str(query or "").lower().strip()
+    if not lowered:
+        return True
+    generic_phrases = {
+        "what products do you have",
+        "show products",
+        "show me products",
+        "what do you have",
+        "what all do you have",
+        "available products",
+        "show catalog",
+        "show menu",
+        "products",
+        "catalog",
+        "menu",
+    }
+    return lowered in generic_phrases or "products do you have" in lowered or "what do you have" in lowered
+
+
+def _tool_search_catalog(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    business_id = user.get("business_id", DEFAULT_BUSINESS_ID)
+    query = str(args.get("query") or args.get("search") or "").strip()
+    generic_browse = _is_generic_browse_query(query)
+    products = get_product_catalog(
+        business_id=business_id,
+        filter_category=args.get("category"),
+        search=None if generic_browse else (query or None),
+        limit=min(max(int(args.get("limit", 8) or 8), 1), 12),
+    )
+    ranked = rank_products("products" if generic_browse else (query or "products"), products, profile=args.get("profile") or {}, learning_profile=args.get("learning") or {})
+    top = ranked[:5]
+    if not top:
+        return ToolObservation(
+            tool="search_catalog",
+            ok=True,
+            message=style_text(style, "I couldn't find matching products right now.", "Ippo exact match kandethan pattiyilla.", "ഇപ്പോൾ കൃത്യമായ പൊരുത്തമുള്ള ഉൽപ്പന്നങ്ങൾ കണ്ടെത്താനായില്ല."),
+            data={"results": []},
+        )
+    header = style_text(style, "Here are some products you can order:", "Order cheyyan pattunna kurachu products ivide undu:", "ഓർഡർ ചെയ്യാൻ കഴിയുന്ന ചില ഉൽപ്പന്നങ്ങൾ ഇവയാണ്:")
+    lines = [header]
+    for item in top:
+        price = float(item.get("offer_price") or item.get("price") or 0)
+        description = str(item.get("description") or "").strip()
+        line = f"{item.get('display_name', item.get('name', '')).title()} - Rs {price:.2f}"
+        if description:
+            line += f" | {description}"
+        lines.append(line)
+    return ToolObservation(tool="search_catalog", ok=True, message="\n".join(lines), data={"results": top, "products": [item.get("name", "") for item in top]})

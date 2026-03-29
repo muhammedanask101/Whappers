@@ -730,3 +730,49 @@ The system is not “fully autonomous” in the unrealistic sense of having no r
 - it can expose what it did
 
 That is the correct direction for a production WhatsApp business agent.
+
+
+28. Recent Resilience Improvements
+
+The most recent fixes focused on preserving agentic behavior when the planner LLM is temporarily unavailable, without turning the system into a rule-heavy fallback bot.
+
+Key improvements:
+- generic browse requests such as "What products do you have?" now degrade to a safe catalog browsing action instead of being misread as order correction
+- correction tools are no longer eligible as general fallback actions unless the message actually carries correction signals
+- the runtime now stops after any successful user-facing tool response, preventing repeated no-progress loops when a fallback tool has already produced a reply
+- generic product browsing can still surface catalog results even during LLM quota exhaustion, because the browse fallback routes into the catalog tool rather than a clarification dead end
+
+Why this remains agentic:
+- the LLM planner is still the primary decision-maker whenever available
+- tool ranking, memory, workflow state, and uncertainty still shape the fallback path
+- the added safeguards only constrain obviously unsafe or misleading actions during planner failure
+- the browse fallback is low-risk and aligned with user intent, rather than a broad deterministic script
+
+Operational effect:
+- quota failure no longer pushes the agent toward irrelevant correction flows for sales questions
+- user-facing responses are more stable under degraded planner conditions
+- the agent preserves conversational usefulness while staying cost-aware
+
+
+29. Response Time And Reliability Improvements
+
+The latest iteration also focused on reducing chat latency while preserving autonomy.
+
+Changes made:
+- obvious low-risk turns such as greetings and generic product browsing now use a cheap fast-path rather than waiting for planner LLM reasoning
+- product-browse phrasing such as "what do you have" and "I want to see all the products" is recognized as browse intent instead of falling into general or cart flows
+- provider backoff now activates after quota or rate-limit failures, so the system does not keep retrying the same exhausted LLM provider on every incoming message
+- when a provider is in backoff, the agent drops immediately into its safe fallback policy instead of paying repeated delay penalties
+- cheap general and browse turns now use a lightweight memory bundle instead of loading full semantic/history context when that context will not be consumed
+
+Why this is still agentic:
+- the LLM remains the primary planner for ambiguous, high-value, and multi-step decisions
+- the fast-path only handles clear, low-risk intents where a full planner call does not add meaningful value
+- memory, active goals, uncertainty, and tool ranking still shape the chosen response
+- the browse flow still uses real tool execution and catalog retrieval rather than static canned replies
+
+Practical impact:
+- faster replies for greetings and catalog-browse prompts
+- fewer delays during provider quota exhaustion
+- better continuity from prior browse intent into the next turn
+- less user-visible instability when paid model capacity is temporarily constrained

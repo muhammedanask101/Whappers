@@ -12,6 +12,11 @@ from app.services.agent.validator import validate_action
 from app.services.agent.memory import update_goal_tracking
 
 
+def _log_main_agent(event: str, **details: Any) -> None:
+    normalized = " ".join(f"{key}={repr(value)}" for key, value in details.items())
+    print(f"[agent.main] {event} {normalized}".rstrip())
+
+
 MAX_STEPS = 5
 INTERNAL_TOOLS = {
     "inspect_customer_context",
@@ -34,6 +39,7 @@ async def run_agent(
     analysis = analyze_message(user_message, user=user, state=state, learning_profile=learning_profile)
     strategy = build_strategy(user=user, profile=profile, analysis=analysis, state=state)
     strategy["llm_tier"] = select_cost_tier(analysis, state, user)
+    _log_main_agent("run_start", phone=user.get("phone"), role=user.get("role"), intent=analysis.get("intent"), confidence=analysis.get("confidence"), uncertainty=analysis.get("uncertainty"), llm_tier=strategy.get("llm_tier"), workflow=(state.get("workflow") or {}).get("stage"))
 
     scratchpad: List[ToolObservation] = []
     decisions: List[PlannerDecision] = []
@@ -44,6 +50,7 @@ async def run_agent(
     working_state["goal_tracking"] = update_goal_tracking(working_state, intent=analysis["intent"], user_message=user_message)
 
     for step in range(MAX_STEPS):
+        _log_main_agent("step_start", step=step + 1, scratchpad_len=len(scratchpad), goal=(working_state.get("goal_tracking") or {}).get("goal_text"))
         decision = choose_next_action(
             user_message=user_message,
             user=user,
@@ -56,6 +63,7 @@ async def run_agent(
             max_steps=MAX_STEPS,
         )
         decisions.append(decision)
+        _log_main_agent("decision", step=step + 1, action=decision.action, confidence=decision.confidence, rationale=decision.rationale, arguments=decision.arguments)
         working_state["goal_tracking"] = update_goal_tracking(
             working_state,
             intent=analysis["intent"],
@@ -64,16 +72,19 @@ async def run_agent(
         )
 
         if decision.action == "respond":
+            _log_main_agent("respond_decision", step=step + 1, message_preview=(decision.message or "")[:240])
             final_reply = decision.message or _fallback_message(analysis["intent"], strategy, style)
             break
 
         valid, error = validate_action(decision.action, decision.arguments)
         if not valid:
+            _log_main_agent("validation_failed", step=step + 1, action=decision.action, error=error)
             scratchpad.append(ToolObservation(tool=decision.action, ok=False, message="", error=error))
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.2)
             continue
 
+        _log_main_agent("tool_execute_start", step=step + 1, action=decision.action)
         observation = execute_tool(
             decision.action,
             decision.arguments | {"profile": profile, "learning": learning_profile, "memory": working_memory},
@@ -83,6 +94,7 @@ async def run_agent(
             working_memory,
         )
         scratchpad.append(observation)
+        _log_main_agent("tool_execute_complete", step=step + 1, tool=observation.tool, ok=observation.ok, error=observation.error, message_preview=observation.message[:240])
         _merge_state_patch(working_state, observation.state_patch)
         _merge_memory_from_observation(working_memory, observation)
         working_state["goal_tracking"] = update_goal_tracking(
@@ -100,6 +112,7 @@ async def run_agent(
                 pass
 
         if not observation.ok:
+            _log_main_agent("tool_failed", step=step + 1, tool=observation.tool, uncertainty_before=analysis.get("uncertainty"))
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.22)
             if step == MAX_STEPS - 1:
@@ -115,8 +128,7 @@ async def run_agent(
             analysis["needs_llm"] = False
             continue
 
-        if decision.action in {"manage_cart", "search_catalog", "get_product_details", "recommend_products", "get_order_status", "create_support_ticket", "checkout_order", "vendor_update_order_status", "resolve_support_ticket"}:
-            break
+        break
 
     if not final_reply:
         last_error = next((row.error for row in reversed(scratchpad) if row.error), "")
@@ -131,6 +143,7 @@ async def run_agent(
     run_summary = summarize_run(reflections=reflections, final_reply=final_reply, state=working_state)
     if run_summary.get("recovery_needed") and not final_reply:
         final_reply = contact_reply_prompt(style)
+    _log_main_agent("run_complete", phone=user.get("phone"), final_reply_preview=final_reply[:240], steps=len(decisions), failures=run_summary.get("failures"), uncertainty=analysis.get("uncertainty"))
 
     return AgentRunResult(
         reply=final_reply,

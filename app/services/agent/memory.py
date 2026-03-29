@@ -210,6 +210,8 @@ def update_goal_tracking(
 ) -> Dict[str, Any]:
     tracking = dict(DEFAULT_STATE["goal_tracking"])
     tracking.update(state.get("goal_tracking") or {})
+    if _should_reset_goal(tracking, intent):
+        tracking = dict(DEFAULT_STATE["goal_tracking"])
     if not tracking.get("goal_text"):
         tracking["goal_type"] = intent
         tracking["goal_text"] = _goal_text(intent, user_message)
@@ -282,6 +284,7 @@ def _semantic_query(state: Dict[str, Any], summary: Dict[str, Any], learning: Di
 
 def _goal_text(intent: str, user_message: str) -> str:
     templates = {
+        "general": "Understand the customer's need before taking action.",
         "cart": "Understand demand and prepare the right cart.",
         "checkout": "Collect missing purchase details and place the order.",
         "order_status": "Resolve the order status request with certainty.",
@@ -290,3 +293,14 @@ def _goal_text(intent: str, user_message: str) -> str:
         "vendor_ops": "Help the vendor complete the operational request correctly.",
     }
     return templates.get(intent, user_message[:200] or "Assist the conversation effectively.")
+
+
+def _should_reset_goal(tracking: Dict[str, Any], intent: str) -> bool:
+    if not tracking.get("goal_text"):
+        return False
+    if tracking.get("status") == "completed":
+        return True
+    current = str(tracking.get("goal_type") or "")
+    if intent == "general":
+        return False
+    return bool(current and current != intent and not tracking.get("current_plan"))

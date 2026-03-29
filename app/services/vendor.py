@@ -14,6 +14,11 @@ from app.services.agent.localization import contact_style, status_phrase, style_
 from app.models.order import OrderRecord
 
 
+def _log_vendor(event: str, **details: Any) -> None:
+    normalized = " ".join(f"{key}={repr(value)}" for key, value in details.items())
+    print(f"[vendor] {event} {normalized}".rstrip())
+
+
 def normalize_phone(phone: str) -> str:
     phone = phone.strip()
     if not phone:
@@ -33,6 +38,7 @@ def normalize_phone(phone: str) -> str:
 def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None) -> Dict[str, Any]:
     normalized_to = normalize_phone(to)
     normalized_from = normalize_phone(from_number or os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip())
+    _log_vendor("send_whatsapp_message_start", to=normalized_to, from_number=normalized_from, body_preview=body[:240], debug_mode=os.getenv("DEBUG", "").strip().lower() == "true")
     if os.getenv("DEBUG", "").strip().lower() == "true":
         print("=== DEBUG WHATSAPP MESSAGE ===")
         print(f"FROM: {normalized_from}")
@@ -55,12 +61,17 @@ def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None)
         method="POST",
     )
     try:
+        _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body))
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8"))
+            _log_vendor("external_api_response", provider="twilio", sid=data.get("sid"), status=data.get("status"), to=normalized_to)
+            return data
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
+        _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}")
         raise RuntimeError(f"Twilio message send failed: {exc.code} {detail}") from exc
     except urllib.error.URLError as exc:
+        _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason))
         raise RuntimeError(f"Twilio message send failed: {exc.reason}") from exc
 
 

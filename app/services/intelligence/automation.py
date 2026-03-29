@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List
 
-from app.db.mongo import get_collection, utc_now
+from app.db.mongo import get_collection, parse_datetime, utc_now
 from app.services.agent.learning import record_event
 from app.services.agent.metrics import record_metric
 from app.services.agent.localization import contact_style, style_text
@@ -253,6 +253,9 @@ def _blocked_by_spam_guard(business_id: str, phone: str) -> bool:
 def _as_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    parsed = parse_datetime(value)
+    if parsed:
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     return None
 
 
@@ -275,7 +278,8 @@ def _order_escalation_score(order: Dict[str, Any], status: str, minutes_open: fl
 
 
 def _support_recovery_score(ticket: Dict[str, Any]) -> float:
-    age_hours = max(0.0, (utc_now() - ticket.get("created_at")).total_seconds() / 3600.0) if isinstance(ticket.get("created_at"), datetime) else 6.0
+    created_at = _as_datetime(ticket.get("created_at"))
+    age_hours = max(0.0, (utc_now() - created_at).total_seconds() / 3600.0) if created_at else 6.0
     priority = str(ticket.get("priority") or "normal")
     priority_boost = {"high": 0.28, "urgent": 0.4}.get(priority, 0.12)
     return round(min(1.0, min(age_hours / 24.0, 1.0) * 0.52 + priority_boost + 0.2), 4)

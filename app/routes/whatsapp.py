@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Form, HTTPException, Response, status, Request
 
 from app.services.agent.controller import process_incoming_message
+from app.services.llm import safe_user_facing_text
 from app.services.vendor import (
     get_business_by_vendor_phone,
     get_business_by_whatsapp_number,
@@ -30,6 +31,11 @@ validator = RequestValidator(TWILIO_AUTH_TOKEN)
 router = APIRouter(tags=["whatsapp"])
 
 
+def _log_whatsapp(event: str, **details):
+    normalized = " ".join(f"{key}={repr(value)}" for key, value in details.items())
+    print(f"[route.whatsapp] {event} {normalized}".rstrip())
+
+
 # 🔐 Verify Twilio request
 async def verify_request(request: Request):
     signature = request.headers.get("X-Twilio-Signature", "")
@@ -57,6 +63,7 @@ async def whatsapp_webhook(
     From: str = Form(""),
     To: str = Form("")
 ) -> Response:
+    _log_whatsapp("webhook_received", from_number=From, to_number=To, body_preview=Body[:240], env=os.getenv("ENV"))
 
     # 🔐 Security check (skip in dev if needed)
     if os.getenv("ENV") == "prod":
@@ -80,6 +87,7 @@ async def whatsapp_webhook(
         )
 
     role = "vendor" if sender == business.get("vendor_phone") else "customer"
+    _log_whatsapp("business_resolved", sender=sender, recipient=recipient, business_id=business.get("business_id"), role=role)
 
     reply = await process_incoming_message(
         Body,
@@ -90,11 +98,15 @@ async def whatsapp_webhook(
             "business_name": business["name"],
         },
     )
+    reply = safe_user_facing_text(reply)[:1500]
+
+    _log_whatsapp("reply_ready", sender=sender, role=role, reply_preview=reply[:240])
 
     send_whatsapp_message(
         sender,
         reply,
         from_number=business.get("whatsapp_number")
     )
+    _log_whatsapp("webhook_complete", sender=sender, business_id=business.get("business_id"))
 
     return Response(content="", media_type="text/plain", status_code=200)
