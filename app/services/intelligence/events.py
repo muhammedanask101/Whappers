@@ -1,35 +1,13 @@
-from datetime import datetime, timedelta
+from __future__ import annotations
 
-from app.db.mongo import get_collection
-from app.services.vendor import send_whatsapp_message
+from typing import Any, Dict
 
-
-def trigger_event(event_type: str, data: dict):
-    if event_type == "order_created":
-        handle_order_created(data)
-
-    if event_type == "user_inactive":
-        handle_user_inactive(data)
+from app.services.agent.learning import record_event
 
 
-# -------------------------
-# EVENT HANDLERS
-# -------------------------
-
-def handle_order_created(data: dict):
-    phone = data["phone"]
-    business_id = data["business_id"]
-
-    # Follow-up message after order
-    message = "Thanks for your order! 😊 We’ll update you soon. Let me know if you need anything else."
-
-    send_whatsapp_message(phone, message)
-
-
-def handle_user_inactive(data: dict):
-    phone = data["phone"]
-    business_id = data["business_id"]
-
-    message = "Hey! It’s been a while 👀\nWe have some great offers waiting for you. Want to see?"
-
-    send_whatsapp_message(phone, message)
+def trigger_event(event_type: str, data: Dict[str, Any]) -> None:
+    business_id = str(data.get("business_id") or "")
+    phone = str(data.get("phone") or "")
+    if not business_id:
+        return
+    record_event(event_type, business_id=business_id, phone=phone, payload=data)

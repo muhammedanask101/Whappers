@@ -5,9 +5,10 @@ from pymongo import ReturnDocument
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 from app.models.order import OrderItem, OrderRecord
-from app.services.vendor import get_pricing_adjustments, get_product_catalog_map, normalize_product_name
+from app.services.agent.localization import style_text
 from app.services.intelligence.customer_profile import update_customer_profile
 from app.services.intelligence.events import trigger_event
+from app.services.vendor import get_pricing_adjustments, get_product_catalog_map, normalize_product_name
 
 
 def create_order(business_id: str, customer_phone: str, items: List[Dict[str, Any]], address: str) -> OrderRecord:
@@ -25,11 +26,7 @@ def create_order(business_id: str, customer_phone: str, items: List[Dict[str, An
     )
 
     update_customer_profile(customer_phone, business_id, order.model_dump())
-
-    trigger_event("order_created", {
-        "phone": customer_phone,
-        "business_id": business_id
-    })
+    trigger_event("order_created", {"phone": customer_phone, "business_id": business_id})
 
     get_collection("orders").insert_one(
         {
@@ -56,26 +53,18 @@ VALID_TRANSITIONS = {
 
 
 def update_order_status(order_id: str, status: str, business_id: str = DEFAULT_BUSINESS_ID) -> Optional[OrderRecord]:
-    current = get_collection("orders").find_one(
-        {"business_id": business_id, "order_id": order_id}
-    )
-
+    current = get_collection("orders").find_one({"business_id": business_id, "order_id": order_id})
     if not current:
         return None
-
     current_status = current.get("status")
-
-    # 🔥 Enforce lifecycle
     allowed = VALID_TRANSITIONS.get(current_status, [])
     if status not in allowed:
-        return None  # ❌ block invalid transitions
-
+        return None
     document = get_collection("orders").find_one_and_update(
         {"business_id": business_id, "order_id": order_id},
         {"$set": {"status": status, "updated_at": utc_now()}},
         return_document=ReturnDocument.AFTER,
     )
-
     return _doc_to_order(document) if document else None
 
 
@@ -188,17 +177,17 @@ def build_order_preview(items: List[Dict[str, Any]], address: str, style: str = 
             detail += f" ({line['promotion']})"
         price_lines.append(detail)
 
-    if style == "malayalam":
-        suffix = "YES അയച്ചാൽ confirm ചെയ്യും, NO അയച്ചാൽ cancel ചെയ്യും."
-    elif style == "manglish":
-        suffix = "YES ayachal confirm, NO ayachal cancel."
-    else:
-        suffix = "Reply YES to confirm or NO to cancel."
-
-    message = (
-        "Order preview:\n"
-        + "\n".join(price_lines)
-        + f"\nAddress: {address}\nEstimated total: Rs {pricing['total']:.2f}\n{suffix}"
+    suffix = style_text(
+        style,
+        "Reply confirm to place the order.",
+        "Confirm ennu reply cheythal order place cheyyam.",
+        "Confirm എന്ന് reply ചെയ്താൽ order place ചെയ്യും.",
+    )
+    message = style_text(
+        style,
+        "Order preview:\n" + "\n".join(price_lines) + f"\nAddress: {address}\nEstimated total: Rs {pricing['total']:.2f}\n{suffix}",
+        "Order preview:\n" + "\n".join(price_lines) + f"\nAddress: {address}\nEstimated total: Rs {pricing['total']:.2f}\n{suffix}",
+        "ഓർഡർ പ്രിവ്യൂ:\n" + "\n".join(price_lines) + f"\nവിലാസം: {address}\nഏകദേശം ആകെ: Rs {pricing['total']:.2f}\n{suffix}",
     )
     return {"message": message, "total": f"{pricing['total']:.2f}"}
 
@@ -221,14 +210,8 @@ def _doc_to_order(document: Dict[str, Any]) -> OrderRecord:
 
 
 def update_order_address(order_id: str, address: str, business_id: str):
-    from app.db.mongo import get_orders_collection
-
-    orders = get_orders_collection()
-
-    result = orders.find_one_and_update(
-        {"orderId": order_id, "business_id": business_id},
-        {"$set": {"address": address}},
-        return_document=True
+    return get_collection("orders").find_one_and_update(
+        {"order_id": order_id, "business_id": business_id},
+        {"$set": {"address": address, "updated_at": utc_now()}},
+        return_document=ReturnDocument.AFTER,
     )
-
-    return result

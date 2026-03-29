@@ -1,272 +1,194 @@
-from typing import Dict, Any, List
+from __future__ import annotations
 
+from typing import Any, Dict, List
 
-from app.services.llm import call_llm
-from app.services.agent_legacy import _handle_pending_action, execute_tool
+from app.services.agent.localization import contact_reply_prompt, style_text
+from app.services.agent.planner import choose_next_action
+from app.services.agent.policy import analyze_message, build_strategy, select_cost_tier
+from app.services.agent.reflection import reflect_step, summarize_run
+from app.services.agent.tools import execute_tool
+from app.services.agent.types import AgentRunResult, PlannerDecision, ToolObservation
 from app.services.agent.validator import validate_action
-import re
-import json
-
-def extract_ticket_id(message: str) -> str:
-    """
-    Extracts ticket ID like SUP_123 or SUP-123 from text
-    """
-    match = re.search(r"(SUP[_-]?\d+)", message.upper())
-    return match.group(1) if match else ""
+from app.services.agent.memory import update_goal_tracking
 
 
 MAX_STEPS = 5
-
-TOOLS_SCHEMA = """
-Available tools:
-
-1. get_products
-2. get_product_details
-3. get_business_info
-4. create_order
-5. get_order_status
-6. update_order_status
-7. create_support_ticket
-8. resolve_support_ticket
-9. add_product
-10. update_product
-11. delete_product
-12. create_offer
-13. create_promotion
-14. create_event
-15. update_business_info
-16. send_broadcast
-17. respond
-"""
+INTERNAL_TOOLS = {
+    "inspect_customer_context",
+    "inspect_order_context",
+    "inspect_support_context",
+    "inspect_business_context",
+    "inspect_memory_context",
+}
 
 
-async def run_agent(user_message: str, user: Dict, state: Dict) -> str:
-    """
-    Unified Agent Loop (ReAct-style)
-    """
+async def run_agent(
+    user_message: str,
+    user: Dict[str, Any],
+    state: Dict[str, Any],
+    memory_payload: Dict[str, Any],
+    profile: Dict[str, Any],
+    learning_profile: Dict[str, Any],
+    style: str,
+) -> AgentRunResult:
+    analysis = analyze_message(user_message, user=user, state=state, learning_profile=learning_profile)
+    strategy = build_strategy(user=user, profile=profile, analysis=analysis, state=state)
+    strategy["llm_tier"] = select_cost_tier(analysis, state, user)
 
-    scratchpad: List[Dict[str, Any]] = []
-
-    # -------------------------
-# 🚨 VENDOR STATUS HANDLING (INSERT HERE)
-# -------------------------
-    if user.get("role") == "vendor":
-
-        from app.services.agent_legacy import _infer_vendor_status
-        from app.services.order import get_latest_order
-
-        status = _infer_vendor_status(user_message)
-
-        if status:
-            scratchpad.append({
-                "step": "system",
-                "action": "vendor_status_detected",
-                "arguments": {"status": status},
-                "result": f"Vendor indicated status: {status}",
-                "status": "info"
-            })
-
+    scratchpad: List[ToolObservation] = []
+    decisions: List[PlannerDecision] = []
+    reflections: List[Dict[str, Any]] = []
+    working_state = dict(state)
+    working_memory = dict(memory_payload)
+    final_reply = ""
+    working_state["goal_tracking"] = update_goal_tracking(working_state, intent=analysis["intent"], user_message=user_message)
 
     for step in range(MAX_STEPS):
-
-    # -------------------------
-    # 🔥 FORCE FLOW COMPLETION (ADDRESS / PENDING STATE)
-    # -------------------------
-        if state.get("pending_address"):
-            pending = state["pending_address"]
-
-            scratchpad.append({
-                "step": "system",
-                "action": "pending_address",
-                "arguments": {},
-                "result": f"User must provide address for order {pending.get('order_id')}",
-                "status": "info"
-            })
-
-        # -------------------------
-        # BUILD PROMPT
-        # -------------------------
-        prompt = build_prompt(
+        decision = choose_next_action(
             user_message=user_message,
-            state=state,
+            user=user,
+            state=working_state,
+            memory_payload=working_memory,
+            analysis=analysis,
+            strategy=strategy,
+            learning_profile=learning_profile,
             scratchpad=scratchpad,
-            user=user
+            max_steps=MAX_STEPS,
+        )
+        decisions.append(decision)
+        working_state["goal_tracking"] = update_goal_tracking(
+            working_state,
+            intent=analysis["intent"],
+            user_message=user_message,
+            decision={"plan_steps": decision.plan_steps, "goal": decision.goal},
         )
 
-        pending = state.get("pendingAction")
+        if decision.action == "respond":
+            final_reply = decision.message or _fallback_message(analysis["intent"], strategy, style)
+            break
 
-        if pending and pending.get("type") == "draft_tool":
-            return _handle_pending_action(user_message, user, state.get("lastLanguage"), state)
+        valid, error = validate_action(decision.action, decision.arguments)
+        if not valid:
+            scratchpad.append(ToolObservation(tool=decision.action, ok=False, message="", error=error))
+            analysis["needs_llm"] = True
+            analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.2)
+            continue
 
-        if user["role"] == "vendor":
-            msg = user_message.lower()
+        observation = execute_tool(
+            decision.action,
+            decision.arguments | {"profile": profile, "learning": learning_profile, "memory": working_memory},
+            working_state,
+            user,
+            style,
+            working_memory,
+        )
+        scratchpad.append(observation)
+        _merge_state_patch(working_state, observation.state_patch)
+        _merge_memory_from_observation(working_memory, observation)
+        working_state["goal_tracking"] = update_goal_tracking(
+            working_state,
+            intent=analysis["intent"],
+            user_message=user_message,
+            observation={"tool": observation.tool, "ok": observation.ok},
+        )
+        reflection = reflect_step(step=step + 1, decision=decision, observation=observation, state=working_state)
+        reflections.append(reflection)
+        working_state["last_reflection"] = reflection
 
-            ticket_id = extract_ticket_id(msg)
+        if observation.events:
+            for event in observation.events:
+                pass
 
-            if not ticket_id:
-                return "Please provide a valid ticket ID (e.g., SUP_123)."
+        if not observation.ok:
+            analysis["needs_llm"] = True
+            analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.22)
+            if step == MAX_STEPS - 1:
+                final_reply = observation.error or _fallback_message(analysis["intent"], strategy, style)
+            continue
 
-            result = execute_tool(
-                "resolve_support_ticket",
-                {"ticket_id": ticket_id},
-                state,
-                user,
-                state.get("lastLanguage", "english"),
-                ""
-            )
+        if decision.action in INTERNAL_TOOLS:
+            continue
 
-            return result.get("message", "Done.")
+        final_reply = observation.message
 
-        decision_raw = call_llm(prompt, json_mode=True, temperature=0.2)
+        if decision.action in {"collect_address"} and working_state.get("workflow", {}).get("stage") == "ready_to_checkout":
+            analysis["needs_llm"] = False
+            continue
 
-        # DEBUG (VERY IMPORTANT)
-        print("LLM RAW:", decision_raw)
+        if decision.action in {"manage_cart", "search_catalog", "get_product_details", "recommend_products", "get_order_status", "create_support_ticket", "checkout_order", "vendor_update_order_status", "resolve_support_ticket"}:
+            break
 
-        try:
-            if isinstance(decision_raw, str):
-                decision = json.loads(decision_raw)
-            else:
-                decision = decision_raw
-        except Exception:
-            return "Sorry, I had trouble understanding that. Can you rephrase?"
+    if not final_reply:
+        last_error = next((row.error for row in reversed(scratchpad) if row.error), "")
+        final_reply = last_error or _fallback_message(analysis["intent"], strategy, style)
+    if analysis.get("uncertainty", 0.0) >= 0.72 and not any(row.ok and not row.internal for row in scratchpad):
+        final_reply = _clarification_message(analysis["intent"], style)
 
-        action = decision.get("action")
-        args = decision.get("arguments", {})
-        message = decision.get("message", "")
+    working_state["uncertainty"] = {
+        "score": analysis.get("uncertainty", 0.0),
+        "reason": decisions[-1].rationale if decisions else "",
+    }
+    run_summary = summarize_run(reflections=reflections, final_reply=final_reply, state=working_state)
+    if run_summary.get("recovery_needed") and not final_reply:
+        final_reply = contact_reply_prompt(style)
 
-        # ✅ FINAL RESPONSE
-        if action == "respond":
-            return message or "Okay 👍"
+    return AgentRunResult(
+        reply=final_reply,
+        intent=analysis["intent"],
+        tool_trace=scratchpad,
+        decision_trace=decisions,
+        updated_state=working_state,
+        metrics={
+            "llm_tier": strategy.get("llm_tier"),
+            "analysis_confidence": analysis.get("confidence"),
+            "uncertainty": analysis.get("uncertainty"),
+            "steps": len(decisions),
+            "complexity": analysis.get("complexity"),
+            "goal_progress": (working_state.get("goal_tracking") or {}).get("progress_score", 0.0),
+            "reflection_failures": run_summary.get("failures", 0),
+        },
+        reflections=reflections,
+    )
 
-        # ⚠️ SAFETY
-        if not action:
-            return "Sorry, I didn't understand that. Can you rephrase?"
 
-
-        is_valid, error = validate_action(action, args)
-        # 🔧 EXECUTE TOOL
-        if not is_valid:
-            result = f"Validation failed: {error}"
+def _merge_state_patch(state: Dict[str, Any], patch: Dict[str, Any]) -> None:
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(state.get(key), dict):
+            merged = dict(state[key])
+            merged.update(value)
+            state[key] = merged
         else:
-            try:
-                result = execute_tool(
-                    action,
-                    args,
-                    state,
-                    user,
-                    style="english",   # or dynamic later
-                    llm_message=message
-                )
-            except Exception as e:
-                result = f"Tool execution failed: {str(e)}"
-        status = "error" if isinstance(result, str) and "failed" in result.lower() else "success"
-        # 🧠 ADD OBSERVATION (THIS IS WHAT YOU WERE MISSING)
-        scratchpad.append({
-            "step": step + 1,
-            "action": action,
-            "arguments": args,
-            "result": result,
-            "status": status
-        })
-
-        # 🚨 If tool returned useful data → respond immediately
-        if action in ["get_products", "get_product_details", "get_order_status"]:
-            return str(result)
-
-    return "Something went wrong. Please try again."
+            state[key] = value
 
 
-def build_prompt(user_message: str, state: Dict, scratchpad: List[Dict], user: Dict) -> List[Dict]:
-    pending_instruction = ""
-
-    if state.get("pending_address"):
-        pending = state["pending_address"]
-        pending_instruction = f"""
-    IMPORTANT:
-    User has an incomplete order (order_id={pending.get('order_id')}).
-    You MUST collect delivery address before doing anything else.
-    Do NOT suggest products or restart flow.
-    """
-    """
-    Builds LLM messages with memory + reasoning context
-    """
-
-    system_prompt = f"""
-You are a WhatsApp AI agent for a business.
-
-Your goals:
-- Help users discover and buy products
-- Handle orders and tracking
-- Solve customer support issues
-- Increase revenue when appropriate
-
-You can use tools.
-
-Rules:
-- Think step by step
-- Use tools when needed
-- If you have enough info → respond
-- If not → ask clarification
-- Be natural, like WhatsApp chat
-- Keep answers concise
-
-If a tool fails:
-- Analyze why it failed
-- Try a better action OR fix arguments
-- Do NOT repeat the same mistake
-
-{pending_instruction}
-
-{TOOLS_SCHEMA}
-
-If a tool returns "needs_input":
-- Ask the user for the missing field
-- Wait for user input
-- Then call the appropriate tool to complete the action
+def _merge_memory_from_observation(memory: Dict[str, Any], observation: ToolObservation) -> None:
+    if observation.tool == "inspect_customer_context":
+        memory["customer_context"] = observation.data
+    elif observation.tool == "inspect_order_context":
+        memory["order_context"] = observation.data
+    elif observation.tool == "inspect_support_context":
+        memory["support_context"] = observation.data
+    elif observation.tool == "inspect_business_context":
+        memory["business_context"] = observation.data
+    elif observation.tool == "inspect_memory_context":
+        memory["semantic_context"] = observation.data.get("memories", [])
 
 
-- If user is VIP → prioritize premium products
-- If user is new → guide gently
-- If user is inactive → encourage ordering
-- If user is buying → suggest add-ons
-- If support issue → resolve first, do not sell
-
-If a support ticket exists:
-- Identify the ticket ID
-- Use resolve_support_ticket tool
-- Confirm resolution clearly
-
-Always balance helpfulness with revenue generation.
-
-Customer Info:
-- Phone: {user.get("phone")}
-- Segment: {state.get("segment", "unknown")}
-
-Previous steps:
-{format_scratchpad(scratchpad)}
-
-Respond ONLY in JSON:
-{{
-  "action": "...",
-  "arguments": {{}},
-  "message": "..."
-}}
-"""
-
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
-    ]
+def _fallback_message(intent: str, strategy: Dict[str, Any], style: str) -> str:
+    if strategy.get("support_guard"):
+        return style_text(style, "Please describe the issue in one message and I will work through it.", "Issue oru message-il parayu, njan ath handle cheyyam.", "പ്രശ്നം ഒരു മെസേജിൽ പറയൂ, ഞാൻ അത് കൈകാര്യം ചെയ്യും.")
+    if intent == "cart":
+        return style_text(style, "Tell me the product and quantity you want, and I will build the order.", "Venda productum quantityum parayu, njan order ready aakkam.", "വേണ്ട ഉൽപ്പന്നവും അളവും പറയൂ, ഞാൻ ഓർഡർ തയ്യാറാക്കാം.")
+    if intent == "checkout":
+        return style_text(style, "Share your delivery address and I will prepare the order.", "Delivery address ayachu tharuo, njan order prepare cheyyam.", "ഡെലിവറി വിലാസം അയച്ചു തരൂ, ഞാൻ ഓർഡർ തയ്യാറാക്കാം.")
+    return contact_reply_prompt(style)
 
 
-def format_scratchpad(scratchpad: List[Dict]) -> str:
-    if not scratchpad:
-        return "None"
-
-    lines = []
-    for step in scratchpad:
-        lines.append(
-            f"Step {step['step']}: Action={step['action']} Result={step['result']}"
-        )
-
-    return "\n".join(lines)
+def _clarification_message(intent: str, style: str) -> str:
+    if intent == "cart":
+        return style_text(style, "Please tell me the exact product name and quantity you want.", "Exact product nameum quantityum parayu.", "കൃത്യമായ ഉൽപ്പന്ന നാമവും അളവും പറയൂ.")
+    if intent == "order_status":
+        return style_text(style, "Please share the order ID or the phone number used for the order.", "Order ID allenkil orderinu upayogicha number parayu.", "ഓർഡർ ഐഡിയോ ഓർഡറിന് ഉപയോഗിച്ച ഫോൺ നമ്പറോ പറയൂ.")
+    if intent == "support":
+        return style_text(style, "Please describe the issue, what went wrong, and any related order ID.", "Issue enthaanu, enthaanu wrong ayathu, order ID undenkil athum parayu.", "പ്രശ്നം എന്താണ്, എന്താണ് തെറ്റായത്, ബന്ധപ്പെട്ട ഓർഡർ ഐഡി ഉണ്ടെങ്കിൽ അതും പറയൂ.")
+    return contact_reply_prompt(style)

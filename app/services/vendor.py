@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from pymongo import ReturnDocument
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, generate_id, get_collection, parse_datetime, slugify, to_iso, utc_now
+from app.services.agent.localization import contact_style, status_phrase, style_text
 from app.models.order import OrderRecord
 
 
@@ -651,7 +652,7 @@ def send_vendor_order_notification(order: OrderRecord, business_id: str = DEFAUL
         raise RuntimeError("Vendor phone is not configured for this business.")
 
     try:
-        send_whatsapp_message(vendor_phone, build_vendor_order_message(order), from_number=get_business_profile(business_id).get("whatsapp_number"))
+        send_whatsapp_message(vendor_phone, build_vendor_order_message(order, style=contact_style(vendor_phone, business_id)), from_number=get_business_profile(business_id).get("whatsapp_number"))
         return True
     except Exception as exc:
         print("Vendor notification failed:", str(exc))
@@ -662,15 +663,30 @@ def send_vendor_order_notification(order: OrderRecord, business_id: str = DEFAUL
         return False
 
 
-def build_vendor_order_message(order: OrderRecord) -> str:
-    return (
+def build_vendor_order_message(order: OrderRecord, style: str = "english") -> str:
+    return style_text(
+        style,
         "New Order:\n"
         f"Order ID: {order.orderId}\n"
         f"Items: {', '.join(f'{item.name} x {item.qty}' for item in order.items)}\n"
         f"Address: {order.address}\n"
         f"Customer: {order.customerPhone}\n"
         f"Total: Rs {order.total:.2f}\n"
-        "Reply in natural language like 'accepted', 'dispatch cheythu', or 'delivered'."
+        "Reply naturally like 'accepted', 'dispatch cheythu', or 'delivered'.",
+        "Puthiya order:\n"
+        f"Order ID: {order.orderId}\n"
+        f"Items: {', '.join(f'{item.name} x {item.qty}' for item in order.items)}\n"
+        f"Address: {order.address}\n"
+        f"Customer: {order.customerPhone}\n"
+        f"Total: Rs {order.total:.2f}\n"
+        "Natural ayi 'accepted', 'dispatch cheythu', 'delivered' pole reply cheyyu.",
+        "പുതിയ ഓർഡർ:\n"
+        f"Order ID: {order.orderId}\n"
+        f"Items: {', '.join(f'{item.name} x {item.qty}' for item in order.items)}\n"
+        f"Address: {order.address}\n"
+        f"Customer: {order.customerPhone}\n"
+        f"Total: Rs {order.total:.2f}\n"
+        "‘accepted’, ‘dispatch cheythu’, ‘delivered’ പോലെ സ്വാഭാവികമായി മറുപടി നൽകുക.",
     )
 
 
@@ -703,7 +719,7 @@ def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
     for row in queue.find({"business_id": business_id, "status": "pending"}).sort("created_at", 1):
         order = OrderRecord.model_validate(row["payload_json"])
         try:
-            send_whatsapp_message(vendor_phone, build_vendor_order_message(order), from_number=from_number)
+            send_whatsapp_message(vendor_phone, build_vendor_order_message(order, style=contact_style(vendor_phone, business_id)), from_number=from_number)
             queue.update_one({"_id": row["_id"]}, {"$set": {"status": "sent", "updated_at": utc_now()}, "$inc": {"attempts": 1}})
             sent += 1
         except Exception as exc:
@@ -924,6 +940,66 @@ def _notify_vendor_support_ticket(ticket: Dict[str, Any], business_id: str = DEF
         f"Customer: {ticket['customer_phone']}\n"
         f"Issue: {ticket['issue']}\n"
         f"Order ID: {ticket.get('order_id') or 'N/A'}"
+    )
+    try:
+        send_whatsapp_message(vendor_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+    except Exception as exc:
+        print("Support ticket notification failed:", str(exc))
+        print(message)
+
+
+def format_offer_preview(action: Dict[str, Any], style: str) -> str:
+    date = action.get("date") or "open-ended"
+    return style_text(
+        style,
+        f"Offer preview:\nProduct: {action['product']}\nOffer price: Rs {float(action['price']):.2f}\nUntil: {date}\nReply YES to execute or NO to cancel.",
+        f"Offer preview:\nProduct: {action['product']}\nOffer price: Rs {float(action['price']):.2f}\nUntil: {date}\nYES ayachal execute, NO ayachal cancel.",
+        f"ഓഫർ പ്രിവ്യൂ:\nProduct: {action['product']}\nOffer price: Rs {float(action['price']):.2f}\nUntil: {date}\nYES അയച്ചാൽ execute ചെയ്യും, NO അയച്ചാൽ cancel ചെയ്യും.",
+    )
+
+
+def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_hint: str = "english", business_id: str = DEFAULT_BUSINESS_ID) -> None:
+    message = style_text(
+        style_hint,
+        f"Your order {order.orderId} is now {order.status.replace('_', ' ')}.",
+        f"Ningalude order {order.orderId} ippo {status_phrase(order.status, 'manglish')} aanu.",
+        f"നിങ്ങളുടെ order {order.orderId} ഇപ്പോൾ {status_phrase(order.status, 'malayalam')} ആണ്.",
+    )
+    send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+
+
+def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str) -> str:
+    human_status = status.replace("_", " ")
+    return style_text(
+        style,
+        f"Order {order.orderId} updated to {human_status}.",
+        f"Order {order.orderId} {human_status} ayi update cheythu.",
+        f"Order {order.orderId} {status_phrase(status, 'malayalam')} ആയി update ചെയ്തു.",
+    )
+
+
+def _notify_vendor_support_ticket(ticket: Dict[str, Any], business_id: str = DEFAULT_BUSINESS_ID) -> None:
+    vendor_phone = _vendor_contact_phone(business_id)
+    if not vendor_phone:
+        return
+    style = contact_style(vendor_phone, business_id)
+    message = style_text(
+        style,
+        "Customer Support Ticket:\n"
+        f"Ticket ID: {ticket['ticket_id']}\n"
+        f"Customer: {ticket['customer_phone']}\n"
+        f"Issue: {ticket['issue']}\n"
+        f"Order ID: {ticket.get('order_id') or 'N/A'}",
+        "Customer support ticket:\n"
+        f"Ticket ID: {ticket['ticket_id']}\n"
+        f"Customer: {ticket['customer_phone']}\n"
+        f"Issue: {ticket['issue']}\n"
+        f"Order ID: {ticket.get('order_id') or 'N/A'}",
+        "കസ്റ്റമർ സപ്പോർട്ട് ടിക്കറ്റ്:\n"
+        f"Ticket ID: {ticket['ticket_id']}\n"
+        f"Customer: {ticket['customer_phone']}\n"
+        f"Issue: {ticket['issue']}\n"
+        f"Order ID: {ticket.get('order_id') or 'N/A'}",
     )
     try:
         send_whatsapp_message(vendor_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))

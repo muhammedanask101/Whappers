@@ -1,46 +1,61 @@
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+from typing import Any, Dict, List
 
 from app.db.mongo import get_collection
+from app.services.intelligence.analytics import get_business_metrics, get_top_products
 
 
-def generate_insights(business_id: str) -> list:
-    insights = []
+def generate_insights(business_id: str) -> List[Dict[str, Any]]:
+    metrics = get_business_metrics(business_id)
+    insights: List[Dict[str, Any]] = []
 
-    customers = list(get_collection("customer_profiles").find({
-        "business_id": business_id
-    }))
+    segment_counts = metrics.get("segment_snapshot", {}).get("segment_counts", {})
+    at_risk = int(segment_counts.get("at_risk", 0))
+    vip = int(segment_counts.get("vip", 0))
+    open_tickets = int(metrics.get("open_tickets", 0))
 
-    # 🔥 Inactive customers
-    inactive = [
-        c for c in customers
-        if c.get("last_active_at") and
-        (datetime.utcnow() - c["last_active_at"]).days > 2
-    ]
-
-    if len(inactive) > 5:
-        insights.append({
-            "type": "warning",
-            "message": f"{len(inactive)} customers are inactive. Consider sending a campaign."
-        })
-
-    # 🔥 VIP customers
-    vip = [c for c in customers if c.get("segment") == "vip"]
+    if at_risk >= 3:
+        insights.append(
+            {
+                "type": "retention",
+                "message": f"{at_risk} customers are drifting. Target them with reactivation messages and personalized offers.",
+            }
+        )
 
     if vip:
-        insights.append({
-            "type": "opportunity",
-            "message": f"You have {len(vip)} VIP customers. Offer them exclusive deals."
-        })
+        insights.append(
+            {
+                "type": "value",
+                "message": f"{vip} VIP customers are active. Prioritize premium service and exclusive product drops.",
+            }
+        )
 
-    # 🔥 Low orders
-    orders_count = get_collection("orders").count_documents({
-        "businessId": business_id
-    })
+    if open_tickets:
+        insights.append(
+            {
+                "type": "support",
+                "message": f"There are {open_tickets} open support tickets. Service recovery should take priority over promotion.",
+            }
+        )
 
-    if orders_count < 5:
-        insights.append({
-            "type": "growth",
-            "message": "Low order volume. Consider running promotions."
-        })
+    top_products = get_top_products(business_id)
+    if top_products:
+        top = top_products[0]
+        insights.append(
+            {
+                "type": "product",
+                "message": f"{top['name']} is leading demand. Consider bundling it with adjacent products.",
+            }
+        )
+
+    total_orders = int(metrics.get("total_orders", 0))
+    if total_orders < 5:
+        insights.append(
+            {
+                "type": "growth",
+                "message": "Order volume is still low. Use automation and personalized recommendations to improve conversion.",
+            }
+        )
 
     return insights

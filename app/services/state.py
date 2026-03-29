@@ -6,7 +6,22 @@ from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 def get_conversation_state(phone: str, business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
     document = get_collection("conversation_state").find_one({"business_id": business_id, "phone": phone})
     if not document:
-        return {"phone": phone, "businessId": business_id, "pendingAction": None, "lastLanguage": "english"}
+        return {
+            "phone": phone,
+            "businessId": business_id,
+            "pendingAction": None,
+            "lastLanguage": "english",
+            "workflow": {},
+            "cart": {"items": [], "address": ""},
+            "intent_history": [],
+            "uncertainty": {},
+            "last_order_id": "",
+            "last_vendor_order_id": "",
+            "open_ticket_id": "",
+            "goal_tracking": {},
+            "feedback": {"sentiment": "neutral", "score": 0.0},
+            "last_reflection": {},
+        }
     return {
         "phone": document["phone"],
         "businessId": document.get("business_id", business_id),
@@ -14,6 +29,18 @@ def get_conversation_state(phone: str, business_id: str = DEFAULT_BUSINESS_ID) -
         "pendingAction": document.get("pending_action"),
         "lastLanguage": document.get("last_language") or "english",
         "lastMessage": document.get("last_message"),
+        "workflow": document.get("workflow") or {},
+        "cart": document.get("cart") or {"items": [], "address": ""},
+        "customer_summary": document.get("customer_summary", ""),
+        "intent_history": document.get("intent_history", []),
+        "uncertainty": document.get("uncertainty", {}),
+        "last_order_id": document.get("last_order_id", ""),
+        "last_vendor_order_id": document.get("last_vendor_order_id", ""),
+        "open_ticket_id": document.get("open_ticket_id", ""),
+        "goal_tracking": document.get("goal_tracking") or {},
+        "feedback": document.get("feedback") or {"sentiment": "neutral", "score": 0.0},
+        "last_reflection": document.get("last_reflection") or {},
+        "memory_version": document.get("memory_version", 1),
     }
 
 

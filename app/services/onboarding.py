@@ -1,18 +1,13 @@
-from app.db.mongo import get_collection, utc_now
-import uuid
+from __future__ import annotations
+
+from app.services.vendor import create_business as create_vendor_business
 
 
 def create_business(name: str, vendor_phone: str) -> dict:
-    business_id = f"biz_{uuid.uuid4().hex[:8]}"
-
-    business = {
-        "business_id": business_id,
-        "name": name,
-        "vendor_phone": vendor_phone,
-        "whatsapp_number": "",  # to be set
-        "created_at": utc_now()
-    }
-
-    get_collection("businesses").insert_one(business)
-
-    return business
+    return create_vendor_business(
+        name=name,
+        whatsapp_number=vendor_phone,
+        vendor_phone=vendor_phone,
+        business_type="retail",
+        description="New WhatsApp commerce business.",
+    )

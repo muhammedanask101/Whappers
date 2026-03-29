@@ -5,6 +5,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.db.mongo import get_collection, parse_datetime
 from app.services.admin import delete_business
+from app.services.agent.observability import get_recent_traces
 from app.services.vendor import create_business, get_business_by_id, list_businesses, update_business, get_product_catalog
 from app.services.intelligence.analytics import get_business_metrics, get_top_products
 from app.services.intelligence.insights import generate_insights
@@ -155,3 +156,28 @@ def get_dashboard(business_id: str):
         "top_products": top_products,
         "insights": insights
     }
+
+
+@router.get("/agent-traces")
+def agent_traces(
+    business_id: str = Query(default=""),
+    phone: str = Query(default=""),
+    x_admin_token: Optional[str] = Header(default=None),
+) -> List[Dict[str, Any]]:
+    _require_admin_token(x_admin_token)
+    if not business_id:
+        raise HTTPException(status_code=400, detail="business_id is required.")
+    rows = get_recent_traces(business_id, phone=phone, limit=40)
+    return [
+        {
+            "phone": row.get("phone"),
+            "role": row.get("role"),
+            "message": row.get("message"),
+            "analysis": row.get("analysis", {}),
+            "strategy": row.get("strategy", {}),
+            "goal_tracking": row.get("goal_tracking", {}),
+            "metrics": row.get("metrics", {}),
+            "created_at": parse_datetime(row.get("created_at")).isoformat() if parse_datetime(row.get("created_at")) else None,
+        }
+        for row in rows
+    ]
