@@ -44,6 +44,7 @@ DEFAULT_STATE = {
     },
     "feedback": {"sentiment": "neutral", "score": 0.0},
     "last_reflection": {},
+    "last_tool_gap": {},
     "memory_version": 3,
 }
 
@@ -156,6 +157,7 @@ def persist_state(phone: str, business_id: str, state: Dict[str, Any], role: str
         "goal_tracking": state.get("goal_tracking", {}),
         "feedback": state.get("feedback", {}),
         "last_reflection": state.get("last_reflection", {}),
+        "last_tool_gap": state.get("last_tool_gap", {}),
         "memory_version": 3,
         "updated_at": utc_now(),
     }

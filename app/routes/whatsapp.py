@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Form, HTTPException, Response, status, Request
+import time
 
 from app.services.agent.controller import process_incoming_message
 from app.services.llm import safe_user_facing_text
@@ -29,6 +30,7 @@ if not TWILIO_AUTH_TOKEN:
 validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
 router = APIRouter(tags=["whatsapp"])
+_RECENT_WEBHOOKS: dict[str, float] = {}
 
 
 def _log_whatsapp(event: str, **details):
@@ -55,13 +57,26 @@ def _resolve_business(sender: str, recipient: str):
     return get_business_by_vendor_phone(sender)
 
 
+def _is_duplicate_webhook(message_sid: str, sender: str, body: str) -> bool:
+    now = time.time()
+    expired = [key for key, seen_at in _RECENT_WEBHOOKS.items() if now - seen_at > 180]
+    for key in expired:
+        _RECENT_WEBHOOKS.pop(key, None)
+    dedupe_key = message_sid.strip() or f"{sender}|{body.strip().lower()}"
+    if dedupe_key in _RECENT_WEBHOOKS:
+        return True
+    _RECENT_WEBHOOKS[dedupe_key] = now
+    return False
+
+
 @router.post("/webhook/whatsapp")
 @limiter.limit("10/minute")
 async def whatsapp_webhook(
     request: Request,
     Body: str = Form(""),
     From: str = Form(""),
-    To: str = Form("")
+    To: str = Form(""),
+    MessageSid: str = Form(""),
 ) -> Response:
     _log_whatsapp("webhook_received", from_number=From, to_number=To, body_preview=Body[:240], env=os.getenv("ENV"))
 
@@ -78,6 +93,9 @@ async def whatsapp_webhook(
 
     sender = normalize_phone(From)
     recipient = normalize_phone(To)
+    if _is_duplicate_webhook(MessageSid, sender, Body):
+        _log_whatsapp("webhook_duplicate_ignored", sender=sender, message_sid=MessageSid, body_preview=Body[:120])
+        return Response(content="", media_type="text/plain", status_code=200)
 
     business = _resolve_business(sender, recipient)
     if not business:

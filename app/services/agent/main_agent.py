@@ -119,9 +119,21 @@ async def run_agent(
                 final_reply = observation.error or _fallback_message(analysis["intent"], strategy, style)
             continue
 
+        if _should_replan_after_observation(decision, observation, analysis) and step < MAX_STEPS - 1:
+            _log_main_agent("tool_replan", step=step + 1, tool=observation.tool, intent=analysis.get("intent"))
+            analysis["needs_llm"] = True
+            analysis["uncertainty"] = min(1.0, max(analysis.get("uncertainty", 0.0), 0.48))
+            working_state["last_tool_gap"] = {
+                "tool": observation.tool,
+                "reason": "weak_or_empty_result",
+                "query": decision.arguments.get("query") or decision.arguments.get("raw_message") or user_message,
+            }
+            continue
+
         if decision.action in INTERNAL_TOOLS:
             continue
 
+        working_state["last_tool_gap"] = {}
         final_reply = observation.message
 
         if decision.action in {"collect_address"} and working_state.get("workflow", {}).get("stage") == "ready_to_checkout":
@@ -205,3 +217,12 @@ def _clarification_message(intent: str, style: str) -> str:
     if intent == "support":
         return style_text(style, "Please describe the issue, what went wrong, and any related order ID.", "Issue enthaanu, enthaanu wrong ayathu, order ID undenkil athum parayu.", "പ്രശ്നം എന്താണ്, എന്താണ് തെറ്റായത്, ബന്ധപ്പെട്ട ഓർഡർ ഐഡി ഉണ്ടെങ്കിൽ അതും പറയൂ.")
     return contact_reply_prompt(style)
+def _should_replan_after_observation(decision: PlannerDecision, observation: ToolObservation, analysis: Dict[str, Any]) -> bool:
+    if decision.action == "search_catalog":
+        if observation.data.get("recovery_needed"):
+            return True
+        if analysis.get("intent") == "browse" and not observation.data.get("products"):
+            return True
+    if decision.action == "recommend_products" and analysis.get("intent") == "browse" and not observation.data.get("products"):
+        return True
+    return False

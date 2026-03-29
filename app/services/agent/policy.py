@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-from app.services.agent.learning import learned_token_weights, tokenize
+from app.services.agent.learning import learned_token_weights, rank_token_match, tokenize
 from app.services.agent.tools import vendor_status_candidates
 
 
@@ -15,6 +15,52 @@ INTENT_PRIORS = {
     "checkout": {"checkout", "place", "confirm", "address", "deliver", "ship", "send"},
     "browse": {"show", "available", "options", "catalog", "menu", "products", "suggest", "new", "make", "start"},
     "vendor_ops": {"product", "stock", "offer", "promotion", "broadcast", "business", "update"},
+}
+
+BROWSE_MARKERS = {
+    "show",
+    "see",
+    "browse",
+    "catalog",
+    "menu",
+    "products",
+    "product",
+    "available",
+    "options",
+    "kaanik",
+    "kanik",
+    "undo",
+    "entha",
+}
+
+INTENT_PROTOTYPES = {
+    "browse": [
+        "show me your products",
+        "what products do you have",
+        "i want to browse the catalog",
+        "available products and options",
+        "eth products aan ullath",
+        "products undo",
+        "catalog kaanikk",
+    ],
+    "cart": [
+        "add this to cart",
+        "i want to buy two items",
+        "need 2 pieces",
+        "place order for one product",
+    ],
+    "order_status": [
+        "where is my order",
+        "track my order",
+        "order status update",
+        "when will delivery arrive",
+    ],
+    "support": [
+        "i have a problem with my order",
+        "need help with refund",
+        "this item is damaged",
+        "customer support needed",
+    ],
 }
 
 CORRECTION_PHRASES = {
@@ -51,6 +97,9 @@ def analyze_message(
             if token in priors:
                 scores[intent] += 0.3
             scores[intent] += learned_weights.get(token, 0.0) * 0.45
+    prototype_scores = _intent_prototype_scores(lowered, learning_profile)
+    for intent, score in prototype_scores.items():
+        scores[intent] += score * 0.55
 
     if user.get("role") == "vendor":
         scores["vendor_ops"] += 0.22
@@ -84,6 +133,10 @@ def analyze_message(
         scores["general"] -= 0.12
         if "show" in tokens or "see" in tokens or "all" in tokens:
             scores["cart"] -= 0.16
+    if _browse_intent_strength(tokens) >= 2:
+        scores["browse"] += 0.28
+        if not any(token.isdigit() for token in tokens):
+            scores["cart"] -= 0.18
     if "all the products" in lowered or "see all the products" in lowered or "see what you have" in lowered:
         scores["browse"] += 0.45
         scores["cart"] -= 0.2
@@ -100,18 +153,23 @@ def analyze_message(
     if confidence <= 0.12:
         intent = "general"
         runner_up = ordered[0][1] if ordered else 0.0
-    uncertainty = max(0.0, 0.62 - (confidence - runner_up))
+    margin = max(0.0, confidence - runner_up)
+    calibrated_confidence = _calibrate_confidence(intent, confidence, runner_up, prototype_scores.get(intent, 0.0))
+    uncertainty = _calibrate_uncertainty(intent, confidence, runner_up, prototype_scores.get(intent, 0.0))
 
     return {
         "intent": intent,
         "category": _category_for_intent(intent),
-        "confidence": round(min(0.98, confidence + 0.14), 3),
+        "confidence": round(calibrated_confidence, 3),
         "uncertainty": round(min(1.0, uncertainty), 3),
         "tokens": tokens,
         "signals": ordered,
         "vendor_status_options": status_options,
         "is_correction": correction,
         "probable_address": probable_address,
+        "intent_margin": round(margin, 3),
+        "prototype_score": round(prototype_scores.get(intent, 0.0), 3),
+        "browse_strength": _browse_intent_strength(tokens),
         "complexity": _complexity(message, state, user, status_options),
         "needs_llm": _needs_llm(message, state, user, confidence, runner_up, status_options, probable_address, correction),
     }
@@ -163,7 +221,7 @@ def build_strategy(
 
 
 def select_cost_tier(analysis: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any]) -> str:
-    if analysis.get("intent") in {"general", "browse"} and not (state.get("goal_tracking") or {}).get("current_plan") and not state.get("workflow", {}).get("name"):
+    if cheap_action_allowed(analysis, user, state):
         return "cheap"
     if analysis.get("complexity") in {"high", "multi_step"}:
         return "smart"
@@ -179,9 +237,11 @@ def select_cost_tier(analysis: Dict[str, Any], state: Dict[str, Any], user: Dict
 def cheap_action_allowed(analysis: Dict[str, Any], user: Dict[str, Any], state: Dict[str, Any]) -> bool:
     if (state.get("goal_tracking") or {}).get("current_plan"):
         return False
-    if analysis.get("intent") == "general" and analysis.get("confidence", 0.0) >= 0.14 and not state.get("workflow", {}).get("name"):
+    if state.get("last_tool_gap"):
+        return False
+    if analysis.get("intent") == "general" and analysis.get("confidence", 0.0) >= 0.52 and analysis.get("uncertainty", 1.0) <= 0.42 and analysis.get("prototype_score", 0.0) >= 0.18 and not state.get("workflow", {}).get("name"):
         return True
-    if analysis.get("intent") == "browse" and analysis.get("confidence", 0.0) >= 0.34 and not state.get("workflow", {}).get("name"):
+    if analysis.get("intent") == "browse" and analysis.get("confidence", 0.0) >= 0.58 and analysis.get("uncertainty", 1.0) <= 0.36 and (analysis.get("browse_strength", 0) >= 2 or analysis.get("prototype_score", 0.0) >= 0.45) and not state.get("workflow", {}).get("name"):
         return True
     if user.get("role") == "vendor" and analysis.get("vendor_status_options") and analysis["vendor_status_options"][0]["score"] >= 1.4:
         return True
@@ -266,9 +326,12 @@ def _looks_like_browse_request(lowered: str, tokens: List[str]) -> bool:
         "what products do you have",
         "what do you have",
         "what all do you have",
+        "i want to see products",
+        "i want to see the products",
+        "show me what products you have",
+        "show me what you have",
         "show products",
         "show me products",
-        "show me what you have",
         "i want to see all the products",
         "i want to see the products",
         "show all products",
@@ -280,8 +343,54 @@ def _looks_like_browse_request(lowered: str, tokens: List[str]) -> bool:
     }
     if lowered in phrases:
         return True
+    if ("products" in tokens or "product" in tokens) and any(word in tokens for word in {"show", "see", "browse"}):
+        return True
+    if "what" in tokens and any(word in tokens for word in {"have", "available"}):
+        return True
     if "products" in tokens and any(word in tokens for word in {"show", "see", "available", "all"}):
         return True
     if "what do you have" in lowered or "products do you have" in lowered:
         return True
+    if _browse_intent_strength(tokens) >= 2:
+        return True
     return False
+
+
+def _browse_intent_strength(tokens: List[str]) -> int:
+    score = 0
+    token_set = set(tokens)
+    if token_set & {"show", "see", "browse", "catalog", "menu", "kaanik", "kanik"}:
+        score += 1
+    if token_set & {"products", "product", "available", "options", "undo"}:
+        score += 1
+    if token_set & {"want", "need", "entha"}:
+        score += 1
+    return score
+
+
+def _intent_prototype_scores(lowered: str, learning_profile: Dict[str, Any]) -> Dict[str, float]:
+    results: Dict[str, float] = {}
+    for intent, prototypes in INTENT_PROTOTYPES.items():
+        ranked = rank_token_match(lowered, prototypes, learned_weights=learned_token_weights(learning_profile, intent=intent))
+        results[intent] = float(ranked[0]["score"]) if ranked else 0.0
+    return results
+
+
+def _calibrate_confidence(intent: str, top_score: float, runner_up: float, prototype_score: float) -> float:
+    margin = max(0.0, top_score - runner_up)
+    confidence = 0.22 + top_score * 0.34 + margin * 0.9 + prototype_score * 0.24
+    if intent in {"general", "browse"}:
+        confidence = min(confidence, 0.86)
+    return max(0.18, min(confidence, 0.94))
+
+
+def _calibrate_uncertainty(intent: str, top_score: float, runner_up: float, prototype_score: float) -> float:
+    margin = max(0.0, top_score - runner_up)
+    uncertainty = 0.74 - margin * 0.72 - prototype_score * 0.28
+    if intent == "browse":
+        uncertainty = max(0.14, uncertainty)
+    elif intent == "general":
+        uncertainty = max(0.18, uncertainty)
+    else:
+        uncertainty = max(0.08, uncertainty)
+    return uncertainty

@@ -776,3 +776,64 @@ Practical impact:
 - fewer delays during provider quota exhaustion
 - better continuity from prior browse intent into the next turn
 - less user-visible instability when paid model capacity is temporarily constrained
+
+
+30. Decision Quality And Recovery Stabilization
+
+The latest stabilization pass focused on the exact failure pattern seen in live WhatsApp conversations: clear browse intent degrading into filler prompts, weak search results ending in dead ends, and duplicate webhook executions causing repeated replies.
+
+Root causes identified:
+- browse intent scoring was still too narrow for natural user phrasing such as "I want to see products" and "show me what products you have"
+- cheap-path browse execution could still pass a raw natural-language query directly into catalog search and accept a weak result without recovery
+- tool success was treated as final even when the returned result was empty or strategically weak
+- repeated incoming webhook deliveries were not being deduplicated, increasing the chance of repeated outputs
+
+Implementation changes:
+- browse intent analysis was widened so natural browse phrasing and browse-oriented Manglish-style wording score toward browse more reliably
+- catalog search now treats broad browse prompts as catalog-browse operations instead of exact-match search requests
+- when exact search returns nothing, the catalog tool broadens the query and falls back to top available products before giving up
+- when the catalog tool still cannot produce a useful result, it emits recovery metadata instead of a false success signal
+- the agent runtime now recognizes weak search/recommendation outputs and re-enters planning instead of stopping on a low-value result
+- webhook-level duplicate suppression now ignores repeated deliveries for the same message within a short time window
+
+Why this is still agentic:
+- the system still uses planner reasoning, tool ranking, memory, and uncertainty instead of a fixed intent router
+- recovery is driven by tool outcomes and state, not by a static script tree
+- browse improvement came from better semantic shaping and better tool behavior, not from replacing the agent with hardcoded menus
+
+Net effect:
+- browse prompts more consistently lead to product visibility
+- search failures degrade into broader catalog help instead of "no products found"
+- repeated user attempts improve the response trajectory rather than repeating the same weak answer
+- duplicate webhook deliveries are less likely to create duplicate actions or duplicate replies
+
+
+31. Confidence Calibration And Proactive Decision Quality
+
+The latest pass focused on improving first-decision quality, not only recovery after failure.
+
+Problems addressed:
+- cheap-path confidence could become unrealistically high, which made low-cost decisions look certain even when semantic ambiguity still existed
+- browse and greeting turns could skip planner reasoning too aggressively without enough calibration around margin and semantic evidence
+- multilingual browse requests, especially Manglish phrasing, were not receiving enough semantic support during intent analysis
+- some weak tool outputs could still escape before the agent had a chance to reconsider
+
+Changes made:
+- intent confidence is now calibrated from score margin and semantic prototype strength instead of a simple additive boost
+- uncertainty now has a minimum floor for conversational browse/general turns, which prevents false certainty
+- cheap-path eligibility now depends on calibrated confidence, uncertainty, and semantic evidence rather than raw top-score alone
+- semantic intent prototypes were added for browse, cart, order status, and support to improve intent quality across natural English and Manglish-like phrasing
+- the runtime now remembers recent weak tool gaps and temporarily blocks another cheap path until the agent has had a chance to recover
+- successful useful tool outputs clear the weak-gap state so the agent can resume cost-efficient fast paths afterward
+
+Why this remains agentic:
+- the semantic prototype layer only improves evidence quality for the agent; it does not replace planning
+- planner, memory, tool ranking, and recovery remain the core control system
+- confidence calibration constrains overconfidence, but it does not hardcode final actions
+- multilingual robustness is improved through broader semantic evidence instead of a deterministic keyword router
+
+Practical effect:
+- the agent is less likely to make a wrong cheap decision with near-certain confidence
+- browse requests should reach the correct path earlier and more consistently
+- Manglish browse intent is handled with better first-pass classification
+- weak outputs are more likely to trigger immediate reconsideration instead of reaching the user unchanged

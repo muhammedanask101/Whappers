@@ -224,6 +224,12 @@ def _looks_like_catalog_browse(lowered: str) -> bool:
         return False
     generic_phrases = {
         "what products do you have",
+        "show me what products you have",
+        "show me what you have",
+        "i want to see products",
+        "i want to see the products",
+        "i want to see all the products",
+        "show me the products",
         "show products",
         "show me products",
         "what do you have",
@@ -235,4 +241,47 @@ def _looks_like_catalog_browse(lowered: str) -> bool:
         "catalog",
         "menu",
     }
-    return lowered in generic_phrases or "products do you have" in lowered or "what do you have" in lowered
+    return (
+        lowered in generic_phrases
+        or "products do you have" in lowered
+        or "what do you have" in lowered
+        or ("products" in lowered and any(term in lowered for term in {"show", "see", "browse"}))
+    )
+
+
+def _micro_decision(user_message: str, user: Dict[str, Any], state: Dict[str, Any], analysis: Dict[str, Any]) -> PlannerDecision:
+    lowered = user_message.strip().lower()
+    style = state.get("lastLanguage", "english")
+    if user.get("role") == "vendor" and analysis.get("vendor_status_options"):
+        return PlannerDecision(action="vendor_update_order_status", arguments={"status": analysis["vendor_status_options"][0]["status"], "raw_message": user_message}, rationale="strong_vendor_status_signal", confidence=0.84)
+    if analysis.get("is_correction") and (state.get("workflow", {}).get("name") == "order_checkout" or (state.get("cart") or {}).get("items")):
+        return PlannerDecision(action="repair_order_context", arguments={"raw_message": user_message}, rationale="order_flow_correction_shortcut", confidence=0.8)
+    if analysis.get("intent") == "browse" and _looks_like_catalog_browse(lowered):
+        return PlannerDecision(action="search_catalog", arguments={"query": user_message, "raw_message": user_message}, rationale="cheap_browse_shortcut", confidence=0.68)
+    if analysis.get("intent") == "general":
+        active_goal = str((state.get("goal_tracking") or {}).get("goal_type") or "").strip()
+        if active_goal == "browse":
+            return PlannerDecision(
+                action="respond",
+                message=style_text(style, "Hi. I can show you products. Tell me what type you want, or ask me to show the catalog.", "Hi. Njan products kaanikkam. Ethu type aanu venam enn parayu, allenkil catalog kaanikkan parayu.", "Hi. Njan products kaanikkam. Ethu type aanu venam enn parayu, allenkil catalog kaanikkan parayu."),
+                rationale="cheap_general_browse_reengagement",
+                confidence=0.62,
+            )
+        return PlannerDecision(
+            action="respond",
+            message=style_text(style, "Hi. Tell me what you want to do: browse products, place an order, track an order, or get help.", "Hi. Ningalkku browse cheyyano, order cheyyano, order track cheyyano, allenkil help veeno ennu parayu.", "Hi. Ningalkku browse cheyyano, order cheyyano, order track cheyyano, allenkil help veeno ennu parayu."),
+            rationale="cheap_general_shortcut",
+            confidence=0.58,
+        )
+    if state.get("workflow", {}).get("stage") == "collect_address" and analysis.get("probable_address"):
+        return PlannerDecision(action="collect_address", arguments={"address": user_message, "raw_message": user_message}, rationale="address_capture_shortcut", confidence=0.82)
+    if state.get("workflow", {}).get("stage") == "ready_to_checkout" and lowered in {"yes", "ok", "okay", "confirm", "place", "proceed"}:
+        return PlannerDecision(action="checkout_order", arguments={"raw_message": user_message}, rationale="checkout_confirmation_shortcut", confidence=0.86)
+    if analysis.get("intent") == "browse":
+        return PlannerDecision(
+            action="respond",
+            message=style_text(style, "Tell me what kind of products you want, or ask me to show the full catalog.", "Ethu type products aanu venam enn parayu, allenkil full catalog kaanikkan parayu.", "Ethu type products aanu venam enn parayu, allenkil full catalog kaanikkan parayu."),
+            rationale="browse_specific_prompt",
+            confidence=0.48,
+        )
+    return PlannerDecision(action="respond", message=style_text(style, "Tell me what you need help with, and I will handle it.", "Entha sahayam venam enn parayu, njan handle cheyyam.", "Entha sahayam venam enn parayu, njan handle cheyyam."), rationale="micro_fallback", confidence=0.28)

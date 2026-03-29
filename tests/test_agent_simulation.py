@@ -36,6 +36,7 @@ from app.services.agent.memory import DEFAULT_STATE, update_goal_tracking
 from app.services.agent.policy import analyze_message, cheap_action_allowed, select_cost_tier
 from app.services.agent.planner import choose_next_action
 from app.services.agent.types import PlannerDecision, ToolObservation
+from app.services.agent.tools import execute_tool
 from app.services.intelligence.recommendations import recommend_products
 
 
@@ -164,11 +165,65 @@ class AgentSimulationTests(unittest.TestCase):
         analysis = analyze_message("I want to see all the products", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
         self.assertEqual(analysis["intent"], "browse")
 
+    def test_show_me_what_products_you_have_maps_to_browse(self) -> None:
+        analysis = analyze_message("show me what products you have", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "browse")
+
+    def test_i_want_to_see_products_maps_to_browse(self) -> None:
+        analysis = analyze_message("I want to see products", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "browse")
+
+    def test_catalog_search_recovers_to_broad_listing(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        try:
+            def _catalog(**kwargs):
+                if kwargs.get("search"):
+                    return []
+                return [
+                    {"name": "hoodie", "display_name": "Hoodie", "description": "Warm hoodie", "price": 500, "offer_price": None},
+                    {"name": "boots", "display_name": "Boots", "description": "Durable boots", "price": 800, "offer_price": None},
+                ]
+
+            def _rank(query, products, profile=None, learning_profile=None):
+                return [{**product, "ranking": {"score": 0.8}} for product in products]
+
+            tools_mod.get_product_catalog = _catalog
+            tools_mod.rank_products = _rank
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            observation = execute_tool(
+                "search_catalog",
+                {"query": "show me what products you have", "profile": {}, "learning": {}},
+                state={},
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(observation.ok)
+            self.assertIn("Hoodie", observation.message)
+            self.assertTrue(observation.data.get("products"))
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+
     def test_general_and_browse_turns_are_cheap_when_safe(self) -> None:
         state = {"workflow": {}, "goal_tracking": {}}
         analysis = analyze_message("What do you have?", user={"role": "customer"}, state=state, learning_profile={})
         self.assertTrue(cheap_action_allowed(analysis, {"role": "customer"}, state))
         self.assertEqual(select_cost_tier(analysis, state, {"role": "customer"}), "cheap")
+        self.assertLess(analysis["confidence"], 0.9)
+        self.assertGreater(analysis["uncertainty"], 0.1)
+
+    def test_manglish_browse_maps_to_browse(self) -> None:
+        analysis = analyze_message("Eth products aan ullath?", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "browse")
 
     def test_browse_fallback_does_not_choose_repair_tool(self) -> None:
         import app.services.agent.planner as planner_mod

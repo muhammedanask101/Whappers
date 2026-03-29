@@ -799,6 +799,11 @@ def _is_generic_browse_query(query: str) -> bool:
         "what products do you have",
         "show products",
         "show me products",
+        "show me what products you have",
+        "show me what you have",
+        "i want to see products",
+        "i want to see the products",
+        "i want to see all the products",
         "what do you have",
         "what all do you have",
         "available products",
@@ -808,29 +813,43 @@ def _is_generic_browse_query(query: str) -> bool:
         "catalog",
         "menu",
     }
-    return lowered in generic_phrases or "products do you have" in lowered or "what do you have" in lowered
+    return lowered in generic_phrases or "products do you have" in lowered or "what do you have" in lowered or ("products" in lowered and any(term in lowered for term in {"show", "see", "browse"}))
 
 
 def _tool_search_catalog(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
     business_id = user.get("business_id", DEFAULT_BUSINESS_ID)
     query = str(args.get("query") or args.get("search") or "").strip()
     generic_browse = _is_generic_browse_query(query)
+    profile = args.get("profile") or {}
+    learning = args.get("learning") or {}
     products = get_product_catalog(
         business_id=business_id,
         filter_category=args.get("category"),
         search=None if generic_browse else (query or None),
         limit=min(max(int(args.get("limit", 8) or 8), 1), 12),
     )
-    ranked = rank_products("products" if generic_browse else (query or "products"), products, profile=args.get("profile") or {}, learning_profile=args.get("learning") or {})
+    ranked = rank_products("products" if generic_browse else (query or "products"), products, profile=profile, learning_profile=learning)
     top = ranked[:5]
+    if not top and query and not generic_browse:
+        broad_products = get_product_catalog(
+            business_id=business_id,
+            filter_category=args.get("category"),
+            search=None,
+            limit=min(max(int(args.get("limit", 8) or 8), 1), 12),
+        )
+        broad_query = _broaden_catalog_query(query)
+        broad_ranked = rank_products(broad_query, broad_products, profile=profile, learning_profile=learning)
+        if broad_ranked:
+            top = broad_ranked[:5]
+            generic_browse = True
     if not top:
         return ToolObservation(
             tool="search_catalog",
             ok=True,
-            message=style_text(style, "I couldn't find matching products right now.", "Ippo exact match kandethan pattiyilla.", "ഇപ്പോൾ കൃത്യമായ പൊരുത്തമുള്ള ഉൽപ്പന്നങ്ങൾ കണ്ടെത്താനായില്ല."),
-            data={"results": []},
+            message=style_text(style, "I couldn't find an exact match. Tell me a category or product type and I will narrow it down.", "Exact match kandilla. Category allenkil product type paranjal njan narrow cheyyam.", "Exact match kandilla. Category allenkil product type paranjal njan narrow cheyyam."),
+            data={"results": [], "products": [], "recovery_needed": True},
         )
-    header = style_text(style, "Here are some products you can order:", "Order cheyyan pattunna kurachu products ivide undu:", "ഓർഡർ ചെയ്യാൻ കഴിയുന്ന ചില ഉൽപ്പന്നങ്ങൾ ഇവയാണ്:")
+    header = style_text(style, "Here are some products you can browse:", "Browse cheyyan pattunna kurachu products ivide undu:", "Browse cheyyan pattunna kurachu products ivide undu:") if generic_browse else style_text(style, "Here are some products you can order:", "Order cheyyan pattunna kurachu products ivide undu:", "ഓർഡർ ചെയ്യാൻ കഴിയുന്ന ചില ഉൽപ്പന്നങ്ങൾ ഇവയാണ്:")
     lines = [header]
     for item in top:
         price = float(item.get("offer_price") or item.get("price") or 0)
@@ -839,4 +858,11 @@ def _tool_search_catalog(args: Dict[str, Any], state: Dict[str, Any], user: Dict
         if description:
             line += f" | {description}"
         lines.append(line)
-    return ToolObservation(tool="search_catalog", ok=True, message="\n".join(lines), data={"results": top, "products": [item.get("name", "") for item in top]})
+    return ToolObservation(tool="search_catalog", ok=True, message="\n".join(lines), data={"results": top, "products": [item.get("name", "") for item in top], "generic_browse": generic_browse})
+
+
+def _broaden_catalog_query(query: str) -> str:
+    lowered = str(query or "").lower()
+    stop_words = {"show", "me", "what", "do", "you", "have", "i", "want", "to", "see", "all", "the", "products", "product", "browse", "please", "can"}
+    tokens = [token for token in lowered.replace("?", " ").replace(",", " ").split() if token and token not in stop_words]
+    return " ".join(tokens) or "products"
