@@ -414,6 +414,181 @@ class AgentSimulationTests(unittest.TestCase):
             tools_mod.record_tool_outcome = original_record_tool_outcome
             tools_mod.record_recommendation_feedback = original_feedback
 
+    def test_remove_quantity_reduces_cart_deterministically(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [{"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None}]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": catalog[0] if name.lower().strip() == "boots" else None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            observation = execute_tool(
+                "manage_cart",
+                {"query": "remove 1 boots"},
+                state={"cart": {"items": [{"name": "boots", "qty": 7}], "address": ""}, "workflow": {}, "cart_meta": {}},
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(observation.ok)
+            self.assertEqual(observation.data["items"][0]["qty"], 6)
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
+    def test_remove_without_quantity_clears_item(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [{"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None}]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": catalog[0] if name.lower().strip() == "boots" else None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            observation = execute_tool(
+                "manage_cart",
+                {"query": "remove boots"},
+                state={"cart": {"items": [{"name": "boots", "qty": 7}], "address": ""}, "workflow": {}, "cart_meta": {}},
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(observation.ok)
+            self.assertEqual(observation.data["items"], [])
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
+    def test_zero_quantity_sets_item_to_removed(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [{"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None}]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": catalog[0] if name.lower().strip() == "boots" else None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            observation = execute_tool(
+                "manage_cart",
+                {"query": "0 boots"},
+                state={"cart": {"items": [{"name": "boots", "qty": 6}], "address": ""}, "workflow": {}, "cart_meta": {}},
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(observation.ok)
+            self.assertEqual(observation.data["items"], [])
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
+    def test_clear_cart_empties_all_items(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        try:
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            observation = execute_tool(
+                "manage_cart",
+                {"query": "clear cart"},
+                state={"cart": {"items": [{"name": "boots", "qty": 6}, {"name": "hoodie", "qty": 1}], "address": ""}, "workflow": {}, "cart_meta": {}},
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(observation.ok)
+            self.assertEqual(observation.data["items"], [])
+        finally:
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+
+    def test_repeated_message_id_is_idempotent(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [{"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None}]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": catalog[0] if name.lower().strip() == "boots" else None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            state = {"cart": {"items": [], "address": ""}, "workflow": {}, "cart_meta": {}}
+            first = execute_tool(
+                "manage_cart",
+                {"query": "give me 7 boots", "message_id": "msg-1"},
+                state=state,
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            state["cart"] = first.state_patch["cart"]
+            state["workflow"] = first.state_patch["workflow"]
+            state["cart_meta"] = first.state_patch["cart_meta"]
+            second = execute_tool(
+                "manage_cart",
+                {"query": "give me 7 boots", "message_id": "msg-1"},
+                state=state,
+                user={"phone": "1", "role": "customer", "business_id": "biz_default"},
+                style="english",
+                memory={},
+            )
+            self.assertTrue(second.ok)
+            self.assertTrue(second.data.get("idempotent_skip"))
+            self.assertEqual(second.data["items"][0]["qty"], 7)
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
     def test_partial_cart_failure_keeps_valid_item(self) -> None:
         import app.services.agent.tools as tools_mod
 

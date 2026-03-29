@@ -27,6 +27,7 @@ DEFAULT_STATE = {
         "next_question": "",
     },
     "cart": {"items": [], "address": "", "updated_at": None},
+    "cart_meta": {},
     "customer_summary": "",
     "intent_history": [],
     "uncertainty": {"score": 0.0, "reason": ""},
@@ -60,6 +61,8 @@ def get_state(phone: str, business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, A
         state["workflow"] = dict(DEFAULT_STATE["workflow"])
     if not isinstance(state.get("cart"), dict):
         state["cart"] = dict(DEFAULT_STATE["cart"])
+    if not isinstance(state.get("cart_meta"), dict):
+        state["cart_meta"] = {}
     if not isinstance(state.get("intent_history"), list):
         state["intent_history"] = []
     if not isinstance(state.get("goal_tracking"), dict):
@@ -149,6 +152,7 @@ def persist_state(phone: str, business_id: str, state: Dict[str, Any], role: str
         "last_message": state.get("lastMessage", ""),
         "workflow": state.get("workflow", {}),
         "cart": state.get("cart", {}),
+        "cart_meta": state.get("cart_meta", {}),
         "customer_summary": state.get("customer_summary", ""),
         "intent_history": state.get("intent_history", [])[-20:],
         "uncertainty": state.get("uncertainty", {}),

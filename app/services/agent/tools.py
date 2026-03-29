@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
@@ -12,7 +15,6 @@ from app.services.agent.learning import (
     record_tool_outcome,
     update_learning_profile,
 )
-from app.services.agent.extraction import extract_cart_candidates
 from app.services.agent.localization import (
     ask_address_text,
     format_cart_message,
@@ -27,6 +29,7 @@ from app.services.agent.ranking import rank_products
 from app.services.agent.semantic_memory import retrieve, summarize_for_prompt
 from app.services.agent.types import ToolObservation
 from app.services.broadcast import execute_broadcast
+from app.services.cart_engine import apply_cart_action, parse_cart_requests
 from app.services.intelligence.recommendations import recommend_products
 from app.services.llm import call_agent_llm
 from app.services.order import (
@@ -60,6 +63,7 @@ from app.services.vendor import (
 
 
 ToolHandler = Callable[[Dict[str, Any], Dict[str, Any], Dict[str, Any], str], ToolObservation]
+logger = logging.getLogger(__name__)
 
 
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
@@ -419,78 +423,88 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
     business_id = user.get("business_id", DEFAULT_BUSINESS_ID)
     cart = dict(state.get("cart") or {"items": [], "address": ""})
     existing_items = list(cart.get("items", []))
-    operation = str(args.get("operation") or "add").strip().lower()
-    raw_items = list(args.get("items") or [])
+    operation = str(args.get("operation") or "").strip().lower()
     query = str(args.get("query") or args.get("raw_message") or "").strip()
     profile = args.get("profile") or {}
     learning = args.get("learning") or {}
 
     if operation == "view":
         return ToolObservation(tool="manage_cart", ok=True, message=format_cart_message(style, existing_items, cart.get("address", "")), data={"items": existing_items, "products": [item.get("name", "") for item in existing_items]})
-
-    if query:
-        allow_llm_fallback = not bool(state.get("llm_calls_this_run"))
-        extracted = extract_cart_candidates(
-            query,
-            llm_fallback=(lambda message: _llm_parse_cart_request(message, get_product_catalog(business_id=business_id, limit=100))) if allow_llm_fallback else None,
+    raw_message = query or str(args.get("raw_message") or "").strip()
+    signature_source = str(args.get("message_id") or "").strip()
+    if not signature_source:
+        raw_timestamp = str(args.get("message_timestamp") or args.get("timestamp") or "").strip()
+        signature_window = "na"
+        if raw_timestamp:
+            try:
+                parsed_timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+                if parsed_timestamp.tzinfo is None:
+                    parsed_timestamp = parsed_timestamp.replace(tzinfo=timezone.utc)
+                signature_window = str(int(parsed_timestamp.timestamp()) // 120)
+            except ValueError:
+                signature_window = raw_timestamp
+        signature_source = f"{raw_message.lower()}::{signature_window or 'na'}::{operation or 'auto'}"
+    action_signature = hashlib.sha1(signature_source.lower().encode("utf-8")).hexdigest()
+    cart_meta = dict(state.get("cart_meta") or {})
+    if action_signature and cart_meta.get("last_action_signature") == action_signature:
+        return ToolObservation(
+            tool="manage_cart",
+            ok=True,
+            message=format_cart_message(style, existing_items, cart.get("address", "")),
+            data={"items": existing_items, "products": [item.get("name", "") for item in existing_items], "idempotent_skip": True},
         )
-        if extracted.get("ambiguous"):
-            return ToolObservation(
-                tool="manage_cart",
-                ok=False,
-                message="",
-                error=style_text(
-                    style,
-                    "I need the quantity paired clearly with each product, for example '2 boots and 3 hoodies'.",
-                    "Oro productinum quantity clear ayi parayu, udaharanam '2 boots and 3 hoodies'.",
-                    "Oro productinum quantity clear ayi parayu, udaharanam '2 boots and 3 hoodies'.",
-                ),
-                data={"warnings": extracted.get("warnings", []), "ambiguous": True},
-            )
-        raw_items.extend(extracted.get("items") or [])
 
-    normalized_input_items: List[Dict[str, Any]] = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        product_name = str(item.get("product_name") or item.get("name") or item.get("product") or "").strip()
-        if not product_name:
-            continue
-        try:
-            quantity = max(1, int(item.get("quantity") or item.get("qty") or 1))
-        except (TypeError, ValueError):
-            quantity = 1
-        normalized_input_items.append({"product_name": product_name, "quantity": quantity})
+    parsed_requests = parse_cart_requests(raw_message)
+    if not parsed_requests:
+        return ToolObservation(tool="manage_cart", ok=False, message="", error=style_text(style, "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'.", "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'.", "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'."), data={})
 
-    resolved_items, missing = _resolve_items(normalized_input_items, business_id, profile, learning)
-    if not resolved_items:
-        unresolved = missing or [str(item.get("product_name") or "") for item in normalized_input_items if item.get("product_name")]
-        error_text = (
-            f"I could not match these products yet: {', '.join(unresolved)}. Please resend the product name or use JSON with product_name and quantity."
-            if unresolved
-            else "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'."
+    current_cart = {"items": existing_items, "address": cart.get("address", "")}
+    missing: List[str] = []
+    resolved_product_names: List[str] = []
+
+    for request in parsed_requests:
+        parsed_action = operation if operation in {"add", "remove", "set", "clear"} else str(request.get("action") or "add")
+        parsed_item = str(request.get("item") or "").strip()
+        parsed_quantity = max(0, int(request.get("qty") or 0))
+        explicit_qty = bool(request.get("explicit_qty"))
+        logger.debug(
+            "cart.manage parsed_action=%r parsed_item=%r parsed_quantity=%r cart_before=%r",
+            parsed_action,
+            parsed_item,
+            parsed_quantity,
+            current_cart,
         )
-        return ToolObservation(tool="manage_cart", ok=False, message="", error=style_text(style, error_text, error_text, error_text), data={"missing_products": unresolved})
 
-    item_map = {normalize_product_name(item.get("name", "")): int(item.get("qty", 1)) for item in existing_items if item.get("name")}
-    if operation == "replace":
-        item_map = {}
-    for item in resolved_items:
-        name = normalize_product_name(item["name"])
-        qty = max(1, int(item.get("qty", 1)))
-        if operation == "remove":
-            remaining = item_map.get(name, 0) - qty
-            if remaining > 0:
-                item_map[name] = remaining
-            else:
-                item_map.pop(name, None)
-        else:
-            item_map[name] = qty if operation == "set" else item_map.get(name, 0) + qty
+        if parsed_action == "clear":
+            current_cart = apply_cart_action(current_cart, "", "clear", 0)
+            logger.debug("cart.manage cart_after=%r", current_cart)
+            continue
 
-    updated_items = [{"name": name, "qty": qty} for name, qty in item_map.items() if qty > 0]
+        if not parsed_item:
+            missing.append(parsed_item or raw_message)
+            continue
+
+        resolved_items, unresolved = _resolve_items([{"product_name": parsed_item, "quantity": parsed_quantity}], business_id, profile, learning)
+        if not resolved_items:
+            missing.extend(unresolved or [parsed_item])
+            continue
+
+        resolved_name = normalize_product_name(resolved_items[0]["name"])
+        current_qty = next((int(row.get("qty") or 0) for row in current_cart.get("items", []) if normalize_product_name(row.get("name", "")) == resolved_name), 0)
+        effective_qty = parsed_quantity
+        if parsed_action == "remove" and not explicit_qty:
+            effective_qty = current_qty
+        current_cart = apply_cart_action(current_cart, resolved_name, parsed_action, effective_qty)
+        resolved_product_names.append(resolved_name)
+        logger.debug("cart.manage cart_after=%r", current_cart)
+
+    updated_items = [{"name": normalize_product_name(item.get("name", "")), "qty": int(item.get("qty") or 0)} for item in current_cart.get("items", []) if int(item.get("qty") or 0) > 0]
+    if not updated_items and current_cart.get("address"):
+        current_cart["address"] = cart.get("address", "")
     stage = "collect_address" if updated_items and not cart.get("address") else ("ready_to_checkout" if updated_items else "")
     state_patch = {
         "cart": {"items": updated_items, "address": cart.get("address", ""), "updated_at": utc_now().isoformat()},
+        "cart_meta": {"last_action_signature": action_signature, "last_action_at": utc_now().isoformat()},
         "workflow": {
             "name": "order_checkout" if updated_items else "",
             "stage": stage,
@@ -505,8 +519,8 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
     if missing:
         warning = f"I could not match: {', '.join(missing)}"
         message += "\n" + style_text(style, warning, warning, warning)
-    for item in resolved_items:
-        record_recommendation_feedback(user["phone"], business_id, product_name=str(item.get("name") or ""), event="clicked")
+    for product_name in resolved_product_names:
+        record_recommendation_feedback(user["phone"], business_id, product_name=product_name, event="clicked")
     return ToolObservation(tool="manage_cart", ok=True, message=message, data={"items": updated_items, "products": [item["name"] for item in updated_items], "missing_products": missing, "partial_success": bool(missing)}, state_patch=state_patch, events=[{"kind": "cart_updated", "payload": {"items": updated_items}}])
 
 
@@ -703,8 +717,9 @@ def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[
             resolved.append({"name": normalized_product["name"], "qty": qty})
             continue
         ranked = rank_products(requested, catalog, profile=profile, learning_profile=learning)
-        if ranked and ranked[0]["ranking"]["score"] >= 0.24:
-            resolved.append({"name": ranked[0]["name"], "qty": qty})
+        best_ranked = max(ranked, key=lambda row: float(((row.get("ranking") or {}).get("score")) or 0.0), default=None)
+        if best_ranked and float(((best_ranked.get("ranking") or {}).get("score")) or 0.0) >= 0.24:
+            resolved.append({"name": best_ranked["name"], "qty": qty})
         else:
             missing.append(requested)
     return resolved, missing
