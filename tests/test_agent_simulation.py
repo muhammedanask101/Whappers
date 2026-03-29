@@ -4,6 +4,7 @@ import asyncio
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 if "pymongo" not in sys.modules:
@@ -34,10 +35,10 @@ if "pydantic" not in sys.modules:
     sys.modules["pydantic"] = pydantic
 
 from app.services.agent.memory import DEFAULT_STATE, update_goal_tracking
-from app.services.agent.policy import analyze_message, cheap_action_allowed, select_cost_tier
+from app.services.agent.policy import analyze_message, build_strategy, cheap_action_allowed, select_cost_tier
 from app.services.agent.planner import choose_next_action, should_interrupt_workflow, decide_action_without_llm, route_by_intent, fallback_by_intent
 from app.services.agent.types import PlannerDecision, ToolObservation
-from app.services.agent.tools import execute_tool
+from app.services.agent.tools import execute_tool, rank_tools
 from app.services.intelligence.recommendations import recommend_products
 
 
@@ -755,6 +756,70 @@ class AgentSimulationTests(unittest.TestCase):
             tools_mod.record_tool_outcome = original_record_tool_outcome
             tools_mod.record_recommendation_feedback = original_feedback
 
+    def test_followup_addition_does_not_modify_existing_product(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [
+                {"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None},
+                {"name": "hoodies", "display_name": "Hoodies", "price": 500, "offer_price": None},
+            ]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": next((row for row in catalog if row["name"] == name.lower().strip()), None)
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95 if product["name"] in query.lower() else 0.1}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            state = {"cart": {"items": [{"name": "boots", "qty": 3}], "address": ""}, "workflow": {}, "cart_meta": {}}
+            observation = execute_tool("manage_cart", {"query": "I also want 7 hoodies"}, state=state, user={"phone": "1", "role": "customer", "business_id": "biz_default"}, style="english", memory={})
+            quantities = {item["name"]: item["qty"] for item in observation.data["items"]}
+            self.assertEqual(quantities["boots"], 3)
+            self.assertEqual(quantities["hoodies"], 7)
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
+    def test_ambiguous_product_requests_clarification(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        try:
+            catalog = [
+                {"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None},
+                {"name": "boots pro", "display_name": "Boots Pro", "price": 1000, "offer_price": None},
+            ]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [
+                {**products[0], "ranking": {"score": 0.74}},
+                {**products[1], "ranking": {"score": 0.7}},
+            ]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            observation = execute_tool("manage_cart", {"query": "add 2 boot"}, state={"cart": {"items": [], "address": ""}, "workflow": {}, "cart_meta": {}}, user={"phone": "1", "role": "customer", "business_id": "biz_default"}, style="english", memory={})
+            self.assertFalse(observation.ok)
+            self.assertIn("clarify", observation.error.lower())
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+
     def test_address_with_house_and_po_is_accepted(self) -> None:
         import app.services.agent.tools as tools_mod
 
@@ -766,9 +831,109 @@ class AgentSimulationTests(unittest.TestCase):
         )
         self.assertTrue(observation.ok)
 
+    def test_invalid_address_requests_more_details(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        observation = tools_mod._tool_collect_address(
+            {"address": "wait"},
+            {"cart": {"items": [], "address": ""}},
+            {"phone": "1", "role": "customer", "business_id": "biz_default"},
+            "english",
+        )
+        self.assertFalse(observation.ok)
+        self.assertIn("address", observation.error.lower())
+
+    def test_valid_address_with_items_returns_preview(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_preview = tools_mod.build_order_preview
+        try:
+            tools_mod.build_order_preview = lambda items, address, style="english", business_id="biz_default": {"message": f"Preview for {address}"}
+            observation = tools_mod._tool_collect_address(
+                {"address": "K.T House, Iriya P.O"},
+                {"cart": {"items": [{"name": "boots", "qty": 1}], "address": ""}},
+                {"phone": "1", "role": "customer", "business_id": "biz_default"},
+                "english",
+            )
+            self.assertTrue(observation.ok)
+            self.assertIn("Preview for", observation.message)
+            self.assertEqual(observation.data["normalized_address"]["address_line"], "K.T House")
+        finally:
+            tools_mod.build_order_preview = original_preview
+
     def test_i_want_to_see_my_order_maps_to_order_status(self) -> None:
         analysis = analyze_message("I want to see my order", user={"role": "customer"}, state={"workflow": {}, "cart": {"items": []}}, learning_profile={})
         self.assertEqual(analysis["intent"], "order_status")
+
+    def test_support_issue_maps_to_support_intent(self) -> None:
+        analysis = analyze_message("My order is late and the item is damaged, I need help", user={"role": "customer"}, state={"workflow": {}, "cart": {"items": []}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "support")
+
+    def test_support_strategy_disables_upsell_and_prioritizes_recovery(self) -> None:
+        analysis = {"intent": "support", "category": "support", "complexity": "multi_step"}
+        strategy = build_strategy(
+            user={"role": "customer"},
+            profile={"segment": "vip"},
+            analysis=analysis,
+            state={"open_ticket_id": "ticket_1", "cart": {"items": []}, "goal_tracking": {}},
+        )
+        self.assertFalse(strategy["upsell_allowed"])
+        self.assertTrue(strategy["support_guard"])
+        self.assertGreater(strategy["support_recovery_priority"], 0.8)
+
+    def test_browse_strategy_uses_customer_context_and_recommendations(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_stats = tools_mod.get_tool_policy_stats
+        try:
+            tools_mod.get_tool_policy_stats = lambda business_id="biz_default": {}
+            analysis = {"intent": "browse", "category": "sales", "complexity": "normal", "uncertainty": 0.22}
+            strategy = build_strategy(
+                user={"role": "customer"},
+                profile={"segment": "repeat"},
+                analysis=analysis,
+                state={"cart": {"items": []}, "goal_tracking": {}},
+            )
+            ranked = rank_tools(
+                user={"role": "customer", "business_id": "biz_default"},
+                state={"cart": {"items": []}, "workflow": {}, "goal_tracking": {}},
+                analysis=analysis,
+                strategy=strategy,
+                learning_profile={},
+                scratchpad=[],
+            )
+            top_names = [row["name"] for row in ranked[:6]]
+            self.assertIn("inspect_customer_context", top_names)
+            self.assertIn("recommend_products", top_names)
+        finally:
+            tools_mod.get_tool_policy_stats = original_stats
+
+    def test_support_strategy_prioritizes_support_context_tools(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_stats = tools_mod.get_tool_policy_stats
+        try:
+            tools_mod.get_tool_policy_stats = lambda business_id="biz_default": {}
+            analysis = {"intent": "support", "category": "support", "uncertainty": 0.31}
+            strategy = build_strategy(
+                user={"role": "customer"},
+                profile={"segment": "new"},
+                analysis=analysis,
+                state={"open_ticket_id": "ticket_1", "cart": {"items": []}, "goal_tracking": {}, "feedback": {"sentiment": "negative"}},
+            )
+            ranked = rank_tools(
+                user={"role": "customer", "business_id": "biz_default"},
+                state={"open_ticket_id": "ticket_1", "cart": {"items": []}, "workflow": {}, "goal_tracking": {}, "feedback": {"sentiment": "negative"}},
+                analysis=analysis,
+                strategy=strategy,
+                learning_profile={},
+                scratchpad=[],
+            )
+            top_names = [row["name"] for row in ranked[:5]]
+            self.assertIn("inspect_support_context", top_names)
+            self.assertIn("create_support_ticket", top_names)
+        finally:
+            tools_mod.get_tool_policy_stats = original_stats
 
     def test_repeated_collect_address_failure_unlocks_workflow(self) -> None:
         import app.services.agent.main_agent as main_mod
@@ -818,6 +983,75 @@ class AgentSimulationTests(unittest.TestCase):
                         llm_mod.call_llm([{"role": "user", "content": "hi"}], json_mode=False, tier="balanced")
                     self.assertEqual(openai_call.call_count, 1)
                     self.assertEqual(gemini_call.call_count, 0)
+
+    def test_vendor_notification_failure_is_graceful(self) -> None:
+        import app.services.vendor as vendor_mod
+
+        original_send = vendor_mod.send_whatsapp_message
+        original_queue = vendor_mod.queue_vendor_notification
+        original_contact = vendor_mod._vendor_contact_phone
+        original_profile = vendor_mod.get_business_profile
+        try:
+            queued = {"value": False}
+
+            def _raise(*args, **kwargs):
+                raise RuntimeError("Twilio message send failed: 429 rate limit")
+
+            vendor_mod.send_whatsapp_message = _raise
+            vendor_mod.queue_vendor_notification = lambda order, business_id="biz_default", error="": queued.__setitem__("value", True)
+            vendor_mod._vendor_contact_phone = lambda business_id="biz_default": "whatsapp:+911234567890"
+            vendor_mod.get_business_profile = lambda business_id="biz_default": {"whatsapp_number": "whatsapp:+911234567891"}
+            order = SimpleNamespace(
+                orderId="ord_1",
+                address="K.T House, Iriya P.O",
+                customerPhone="whatsapp:+911234567890",
+                total=100.0,
+                items=[SimpleNamespace(name="boots", qty=1)],
+                model_dump_json=lambda indent=2: "{}",
+                model_dump=lambda: {},
+            )
+            result = vendor_mod.send_vendor_order_notification(order, business_id="biz_default")
+            self.assertFalse(result)
+            self.assertTrue(queued["value"])
+        finally:
+            vendor_mod.send_whatsapp_message = original_send
+            vendor_mod.queue_vendor_notification = original_queue
+            vendor_mod._vendor_contact_phone = original_contact
+            vendor_mod.get_business_profile = original_profile
+
+    def test_successful_tool_result_stops_agent_loop(self) -> None:
+        import app.services.agent.main_agent as main_mod
+
+        original_choose_next_action = main_mod.choose_next_action
+        original_execute_tool = main_mod.execute_tool
+        try:
+            calls = {"planner": 0}
+
+            def _decision(**kwargs):
+                calls["planner"] += 1
+                return PlannerDecision(action="collect_address", arguments={"address": "K.T House, Iriya P.O"}, confidence=0.9)
+
+            def _tool(*args, **kwargs):
+                return ToolObservation(tool="collect_address", ok=True, message="Preview ready", data={"address": "K.T House, Iriya P.O"}, state_patch={"workflow": {"stage": "ready_to_checkout"}})
+
+            main_mod.choose_next_action = _decision
+            main_mod.execute_tool = _tool
+            result = asyncio.run(
+                main_mod.run_agent(
+                    user_message="My address is K.T House, Iriya P.O",
+                    user={"role": "customer", "phone": "1", "business_id": "biz_default"},
+                    state={"workflow": {"name": "order_checkout", "stage": "collect_address"}, "cart": {"items": [{"name": "boots", "qty": 1}], "address": ""}, "goal_tracking": {}, "tool_failures": {}},
+                    memory_payload={"style": "english"},
+                    profile={},
+                    learning_profile={},
+                    style="english",
+                )
+            )
+            self.assertEqual(result.reply, "Preview ready")
+            self.assertEqual(calls["planner"], 1)
+        finally:
+            main_mod.choose_next_action = original_choose_next_action
+            main_mod.execute_tool = original_execute_tool
 
 
 if __name__ == "__main__":

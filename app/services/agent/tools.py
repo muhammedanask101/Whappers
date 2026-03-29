@@ -15,6 +15,7 @@ from app.services.agent.learning import (
     record_tool_outcome,
     update_learning_profile,
 )
+from app.services.agent.input_parser import normalize_address, parse_user_input
 from app.services.agent.localization import (
     ask_address_text,
     format_cart_message,
@@ -122,6 +123,10 @@ def rank_tools(
     recent_failures = {row.tool for row in (scratchpad or []) if not row.ok}
     tool_success = learning_profile.get("tool_success", {})
     global_tool_stats = get_tool_policy_stats(user.get("business_id", DEFAULT_BUSINESS_ID))
+    customer_context_priority = float(strategy.get("customer_context_priority", 0.0))
+    support_recovery_priority = float(strategy.get("support_recovery_priority", 0.0))
+    business_context_priority = float(strategy.get("business_context_priority", 0.0))
+    memory_priority = float(strategy.get("memory_priority", 0.0))
     ranked: List[Dict[str, Any]] = []
 
     for name, meta in TOOL_REGISTRY.items():
@@ -162,6 +167,24 @@ def rank_tools(
             score += 0.26
         if analysis.get("intent") == "browse" and name in {"inspect_customer_context", "search_catalog", "recommend_products"}:
             score += 0.18
+        if analysis.get("intent") == "browse" and name == "inspect_customer_context":
+            score += customer_context_priority * 0.16
+        if analysis.get("intent") == "browse" and name == "recommend_products":
+            score += customer_context_priority * 0.14
+        if analysis.get("intent") == "browse" and name == "inspect_business_context":
+            score += business_context_priority * 0.12
+        if analysis.get("intent") == "browse" and name == "inspect_memory_context":
+            score += memory_priority * 0.12
+        if analysis.get("intent") == "support" and name == "inspect_support_context":
+            score += support_recovery_priority * 0.22
+        if analysis.get("intent") == "support" and name == "create_support_ticket":
+            score += support_recovery_priority * 0.18
+        if analysis.get("intent") == "support" and name == "inspect_order_context":
+            score += support_recovery_priority * 0.14
+        if analysis.get("intent") == "support" and name == "inspect_business_context":
+            score += business_context_priority * 0.1
+        if analysis.get("intent") == "support" and name == "inspect_memory_context":
+            score += memory_priority * 0.12
         if (state.get("cart") or {}).get("items"):
             if name in {"inspect_order_context", "manage_cart", "collect_address", "checkout_order"}:
                 score += 0.24
@@ -178,6 +201,10 @@ def rank_tools(
             score += 0.16
         if state.get("workflow", {}).get("stage") == "collect_address" and name == "collect_address":
             score += 0.3
+        if strategy.get("goal_persistence") and not scratchpad and name in {"inspect_customer_context", "inspect_support_context", "inspect_business_context", "inspect_memory_context"}:
+            score += 0.08
+        if strategy.get("feedback_bias") in {"negative", "frustrated"} and name in {"inspect_support_context", "create_support_ticket"}:
+            score += 0.14
         ranked.append({"name": name, "description": meta["description"], "internal": meta["internal"], "score": round(score, 4)})
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
@@ -454,12 +481,30 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
             data={"items": existing_items, "products": [item.get("name", "") for item in existing_items], "idempotent_skip": True},
         )
 
-    parsed_requests = parse_cart_requests(raw_message)
+    structured_product = str(args.get("product_id") or args.get("product") or "").strip()
+    structured_quantity = args.get("quantity")
+    if structured_product:
+        try:
+            parsed_quantity = max(0, int(structured_quantity if structured_quantity is not None else 1))
+        except (TypeError, ValueError):
+            parsed_quantity = 1
+        parsed_requests = [
+            {
+                "action": operation if operation in {"add", "remove", "set", "clear"} else "add",
+                "item": structured_product,
+                "qty": parsed_quantity,
+                "explicit_qty": structured_quantity is not None,
+            }
+        ]
+    else:
+        parsed_input = parse_user_input(raw_message)
+        parsed_requests = list(parsed_input.get("cart_requests") or parse_cart_requests(raw_message))
     if not parsed_requests:
         return ToolObservation(tool="manage_cart", ok=False, message="", error=style_text(style, "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'.", "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'.", "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'."), data={})
 
     current_cart = {"items": existing_items, "address": cart.get("address", "")}
     missing: List[str] = []
+    ambiguous: List[str] = []
     resolved_product_names: List[str] = []
 
     for request in parsed_requests:
@@ -484,8 +529,10 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
             missing.append(parsed_item or raw_message)
             continue
 
-        resolved_items, unresolved = _resolve_items([{"product_name": parsed_item, "quantity": parsed_quantity}], business_id, profile, learning)
+        resolved_items, unresolved, ambiguous_matches = _resolve_items([{"product_name": parsed_item, "quantity": parsed_quantity}], business_id, profile, learning)
         if not resolved_items:
+            if ambiguous_matches:
+                ambiguous.extend(ambiguous_matches)
             missing.extend(unresolved or [parsed_item])
             continue
 
@@ -519,9 +566,20 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
     if missing:
         warning = f"I could not match: {', '.join(missing)}"
         message += "\n" + style_text(style, warning, warning, warning)
+    if ambiguous:
+        clarification = f"Please clarify the product: {', '.join(ambiguous)}"
+        if not updated_items:
+            return ToolObservation(
+                tool="manage_cart",
+                ok=False,
+                message="",
+                error=style_text(style, clarification, clarification, clarification),
+                data={"ambiguous_products": ambiguous, "missing_products": missing},
+            )
+        message += "\n" + style_text(style, clarification, clarification, clarification)
     for product_name in resolved_product_names:
         record_recommendation_feedback(user["phone"], business_id, product_name=product_name, event="clicked")
-    return ToolObservation(tool="manage_cart", ok=True, message=message, data={"items": updated_items, "products": [item["name"] for item in updated_items], "missing_products": missing, "partial_success": bool(missing)}, state_patch=state_patch, events=[{"kind": "cart_updated", "payload": {"items": updated_items}}])
+    return ToolObservation(tool="manage_cart", ok=True, message=message, data={"items": updated_items, "products": [item["name"] for item in updated_items], "missing_products": missing, "ambiguous_products": ambiguous, "partial_success": bool(missing or ambiguous)}, state_patch=state_patch, events=[{"kind": "cart_updated", "payload": {"items": updated_items}}])
 
 
 def _tool_collect_address_legacy_removed(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
@@ -696,12 +754,13 @@ def _tool_send_broadcast(args: Dict[str, Any], state: Dict[str, Any], user: Dict
     return ToolObservation(tool="send_broadcast", ok=True, message=style_text(style, f"Broadcast sent to {result.get('sent', 0)} recipients.", f"Broadcast {result.get('sent', 0)} recipients-kku ayachu.", f"Broadcast {result.get('sent', 0)} പേർക്ക് അയച്ചു."), data=result)
 
 
-def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[str, Any], learning: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str]]:
+def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[str, Any], learning: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str], List[str]]:
     catalog = get_product_catalog(business_id=business_id, limit=100)
     exact_map = {str(item.get("name") or "").strip().lower(): item for item in catalog}
     normalized_map = {normalize_product_name(str(item.get("name") or "")): item for item in catalog}
     resolved: List[Dict[str, Any]] = []
     missing: List[str] = []
+    ambiguous: List[str] = []
     for item in items:
         requested = str(item.get("product_name") or item.get("name") or item.get("product") or "").strip()
         qty = max(1, int(item.get("qty") or item.get("quantity") or 1))
@@ -717,12 +776,18 @@ def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[
             resolved.append({"name": normalized_product["name"], "qty": qty})
             continue
         ranked = rank_products(requested, catalog, profile=profile, learning_profile=learning)
-        best_ranked = max(ranked, key=lambda row: float(((row.get("ranking") or {}).get("score")) or 0.0), default=None)
-        if best_ranked and float(((best_ranked.get("ranking") or {}).get("score")) or 0.0) >= 0.24:
+        ranked = sorted(ranked, key=lambda row: float(((row.get("ranking") or {}).get("score")) or 0.0), reverse=True)
+        best_ranked = ranked[0] if ranked else None
+        best_score = float(((best_ranked or {}).get("ranking") or {}).get("score") or 0.0)
+        second_score = float(((ranked[1] if len(ranked) > 1 else {}).get("ranking") or {}).get("score") or 0.0)
+        if best_ranked and best_score >= 0.68 and (best_score - second_score) >= 0.16:
             resolved.append({"name": best_ranked["name"], "qty": qty})
+        elif ranked[:2]:
+            candidate_names = ", ".join(str(candidate.get("display_name") or candidate.get("name") or "").strip() for candidate in ranked[:2] if candidate.get("name"))
+            ambiguous.append(f"{requested} ({candidate_names})" if candidate_names else requested)
         else:
             missing.append(requested)
-    return resolved, missing
+    return resolved, missing, ambiguous
 
 
 def _llm_parse_cart_request(query: str, catalog: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -792,46 +857,21 @@ def vendor_status_candidates(message: str, business_id: str, learning_profile: O
 
 
 def _looks_like_address(message: str) -> bool:
-    raw = str(message or "").strip()
-    lowered = raw.lower()
-    if not lowered:
-        return False
-    conversational = {
-        "no",
-        "wait",
-        "i mean",
-        "not that",
-        "wrong",
-        "change it",
-        "hold on",
-        "later",
-        "okay",
-        "ok",
-        "yes",
-    }
-    if lowered in conversational or any(lowered.startswith(prefix) for prefix in {"no ", "wait ", "i mean ", "change "}):
-        return False
-    segments = [segment.strip() for segment in re.split(r"[,\n]", raw) if segment.strip()]
-    tokens = [token for token in re.split(r"\s+", raw) if token.strip()]
-    if len(segments) < 2 and len(tokens) < 2:
-        return False
-    address_keywords = {"road", "rd", "street", "st", "lane", "house", "building", "floor", "flat", "near", "pin", "city", "district", "post", "po", "junction", "p.o", "villa", "block", "kur", "nagar"}
-    has_keyword = any(token.strip(".,").lower() in address_keywords for token in tokens)
-    has_number = any(any(ch.isdigit() for ch in token) for token in tokens)
-    has_capitalized = any(token[:1].isupper() and len(token) > 1 for token in raw.split())
-    return (len(segments) >= 2 or len(tokens) >= 3) and (has_keyword or has_number or has_capitalized)
+    return bool(normalize_address(message).get("is_valid"))
 
 
 def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
     cart = dict(state.get("cart") or {"items": [], "address": ""})
-    address = str(args.get("address") or args.get("raw_message") or "").strip()
-    if not _looks_like_address(address):
+    raw_address = str(args.get("address") or args.get("raw_message") or "").strip()
+    normalized = normalize_address(raw_address)
+    if not normalized.get("is_valid"):
         return ToolObservation(
             tool="collect_address",
             ok=False,
             message="",
             error=style_text(style, "That doesn't look like a full delivery address yet. Please send the house/building, area, and landmark or PIN.", "Ithu full delivery address pole thonnunnilla. House/building, area, landmark allenkil PIN ayakku.", "ഇത് പൂർണ്ണമായ ഡെലിവറി വിലാസമായി തോന്നുന്നില്ല. വീട്/ബിൽഡിംഗ്, ഏരിയ, ലാൻഡ്മാർക്ക് അല്ലെങ്കിൽ പിൻ അയയ്ക്കൂ."),
         )
+    address = str(normalized.get("normalized") or raw_address)
     cart["address"] = address
     cart["updated_at"] = utc_now().isoformat()
     items = cart.get("items", [])
@@ -849,7 +889,7 @@ def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dic
     if items:
         preview = build_order_preview(items, address, style=style, business_id=user.get("business_id", DEFAULT_BUSINESS_ID))
         message = preview["message"]
-    return ToolObservation(tool="collect_address", ok=True, message=message, data={"address": address, "items": items}, state_patch=state_patch)
+    return ToolObservation(tool="collect_address", ok=True, message=message, data={"address": address, "normalized_address": normalized, "items": items}, state_patch=state_patch)
 
 
 def _tool_repair_order_context(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:

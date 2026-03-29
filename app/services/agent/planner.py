@@ -211,6 +211,7 @@ def should_interrupt_workflow(current_workflow: Dict[str, Any], intent: str, mes
 def route_by_intent(intent: str, message: str, context: Dict[str, Any]) -> str | None:
     lowered = str(message or "").strip().lower()
     workflow = context.get("workflow") or {}
+    analysis = context.get("analysis") or {}
     if intent == "browse":
         return "search_catalog"
     if intent == "order_status":
@@ -219,6 +220,8 @@ def route_by_intent(intent: str, message: str, context: Dict[str, Any]) -> str |
         return "checkout_order"
     if intent == "cart":
         return "manage_cart"
+    if workflow.get("stage") == "collect_address" and analysis.get("probable_address"):
+        return "collect_address"
     if intent == "support":
         return "inspect_support_context"
     return None

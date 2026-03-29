@@ -65,6 +65,9 @@ INTENT_PROTOTYPES = {
         "need help with refund",
         "this item is damaged",
         "customer support needed",
+        "my order is late and i need help",
+        "refund for wrong item",
+        "replace damaged product",
     ],
 }
 
@@ -146,6 +149,9 @@ def analyze_message(
         scores["order_status"] += 0.75
         scores["browse"] -= 0.25
         scores["support"] -= 0.1
+    if any(term in lowered for term in {"refund", "replace", "damaged", "issue", "problem", "wrong item", "late order", "missing item"}):
+        scores["support"] += 0.48
+        scores["browse"] -= 0.18
     if "order" in tokens and any(token in tokens for token in {"see", "view", "track", "status", "where"}):
         scores["order_status"] += 0.34
         scores["browse"] -= 0.12
@@ -243,6 +249,10 @@ def build_strategy(
         "planning_horizon": 3 if analysis.get("complexity") in {"high", "multi_step"} else 2,
         "goal_persistence": bool((state.get("goal_tracking") or {}).get("goal_text")),
         "feedback_bias": (state.get("feedback") or {}).get("sentiment", "neutral"),
+        "customer_context_priority": 0.7 if segment in {"repeat", "vip"} else 0.45,
+        "support_recovery_priority": 0.88 if support_open or mode == "support" else 0.2,
+        "business_context_priority": 0.55 if mode in {"sales", "support"} else 0.3,
+        "memory_priority": 0.66 if analysis.get("complexity") in {"high", "multi_step"} or support_open else 0.3,
     }
 
     if mode == "support":

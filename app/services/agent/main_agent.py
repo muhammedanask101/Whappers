@@ -54,6 +54,27 @@ async def run_agent(
     working_state["force_deterministic_fallback"] = False
     working_state["goal_tracking"] = update_goal_tracking(working_state, intent=analysis["intent"], user_message=user_message)
 
+    if _should_clarify_before_execution(analysis):
+        final_reply = _clarification_message(analysis["intent"], style)
+        working_state["uncertainty"] = {"score": analysis.get("uncertainty", 0.0), "reason": "high_uncertainty_pre_execution"}
+        return AgentRunResult(
+            reply=final_reply,
+            intent=analysis["intent"],
+            tool_trace=[],
+            decision_trace=[],
+            updated_state=working_state,
+            metrics={
+                "llm_tier": strategy.get("llm_tier"),
+                "analysis_confidence": analysis.get("confidence"),
+                "uncertainty": analysis.get("uncertainty"),
+                "steps": 0,
+                "complexity": analysis.get("complexity"),
+                "goal_progress": (working_state.get("goal_tracking") or {}).get("progress_score", 0.0),
+                "reflection_failures": 0,
+            },
+            reflections=[],
+        )
+
     for step in range(MAX_STEPS):
         _log_main_agent("step_start", step=step + 1, scratchpad_len=len(scratchpad), goal=(working_state.get("goal_tracking") or {}).get("goal_text"))
         decision = choose_next_action(
@@ -151,10 +172,10 @@ async def run_agent(
             _relax_workflow_if_stuck(working_state, observation.tool, analysis, user_message)
             continue
 
-        if int(working_state.get("same_tool_counter", 0)) >= 3:
+        if int(working_state.get("same_tool_counter", 0)) >= 2:
             working_state["force_deterministic_fallback"] = True
-            if step < MAX_STEPS - 1:
-                continue
+            final_reply = observation.message or _clarification_message(analysis["intent"], style)
+            break
 
         if _should_replan_after_observation(decision, observation, analysis) and step < MAX_STEPS - 1:
             _log_main_agent("tool_replan", step=step + 1, tool=observation.tool, intent=analysis.get("intent"))
@@ -172,11 +193,6 @@ async def run_agent(
 
         working_state["last_tool_gap"] = {}
         final_reply = observation.message
-
-        if decision.action in {"collect_address"} and working_state.get("workflow", {}).get("stage") == "ready_to_checkout":
-            analysis["needs_llm"] = False
-            continue
-
         break
 
     if not final_reply:
@@ -269,6 +285,18 @@ def _update_tool_loop_state(state: Dict[str, Any], tool: str, made_progress: boo
     else:
         state["same_tool_counter"] = 0 if made_progress else 1
     state["last_tool_used"] = tool
+
+
+def _should_clarify_before_execution(analysis: Dict[str, Any]) -> bool:
+    if float(analysis.get("uncertainty", 0.0)) <= 0.4:
+        return False
+    if analysis.get("cart_view_request"):
+        return False
+    if analysis.get("structured_cart_payload"):
+        return False
+    if analysis.get("probable_address"):
+        return False
+    return analysis.get("intent") in {"cart", "checkout", "order_status", "support"}
 
 
 def _record_tool_failure(state: Dict[str, Any], tool: str) -> None:

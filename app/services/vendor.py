@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,19 +61,30 @@ def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None)
         headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    try:
-        _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body))
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            _log_vendor("external_api_response", provider="twilio", sid=data.get("sid"), status=data.get("status"), to=normalized_to)
-            return data
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}")
-        raise RuntimeError(f"Twilio message send failed: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason))
-        raise RuntimeError(f"Twilio message send failed: {exc.reason}") from exc
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body), attempt=attempt + 1)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                _log_vendor("external_api_response", provider="twilio", sid=data.get("sid"), status=data.get("status"), to=normalized_to)
+                return data
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}", attempt=attempt + 1)
+            last_error = RuntimeError(f"Twilio message send failed: {exc.code} {detail}")
+            if exc.code == 429 and attempt == 0:
+                time.sleep(0.2)
+                continue
+            raise last_error from exc
+        except urllib.error.URLError as exc:
+            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason), attempt=attempt + 1)
+            last_error = RuntimeError(f"Twilio message send failed: {exc.reason}")
+            if attempt == 0:
+                time.sleep(0.2)
+                continue
+            raise last_error from exc
+    raise last_error or RuntimeError("Twilio message send failed.")
 
 
 def normalize_product_name(name: str) -> str:
@@ -976,7 +988,10 @@ def notify_customer_order_update_legacy_removed(customer_phone: str, order: Orde
         f"Ningalude order {order.orderId} ippo {status_phrase(order.status, 'manglish')} aanu.",
         f"നിങ്ങളുടെ order {order.orderId} ഇപ്പോൾ {status_phrase(order.status, 'malayalam')} ആണ്.",
     )
-    send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+    try:
+        send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+    except Exception as exc:
+        _log_vendor("customer_notification_failed", customer_phone=customer_phone, order_id=order.orderId, error=str(exc))
 
 
 def generate_vendor_acknowledgement_legacy_removed(order: OrderRecord, style: str, status: str) -> str:
