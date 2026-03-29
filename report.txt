@@ -1,0 +1,1270 @@
+WHATSAPP AGENT IMPLEMENTATION AND CURRENT WORKING REPORT
+Generated from repository inspection on 2026-03-29
+
+Purpose
+- This report documents the current implementation of the WhatsApp agent for sales, order management, and customer support.
+- It is intended for debugging and traces what the code currently does, how the main flows are wired, what data is persisted, what is currently observable from the local environment, and what implementation mismatches or hotspots are present.
+- No application code was changed while creating this report.
+
+===============================================================================
+1. HIGH-LEVEL SYSTEM SHAPE
+===============================================================================
+
+Current backend stack
+- FastAPI backend in `app/main.py`.
+- Twilio WhatsApp webhook entrypoint in `app/routes/whatsapp.py`.
+- MongoDB is the primary persistence layer in current code via `app/db/mongo.py`.
+- A legacy SQLite database file `commerce.db` still exists locally, but the active backend code does not use it for runtime operations.
+- Session-based manager dashboard is rendered as server-generated HTML in `app/routes/admin.py`.
+- Token-protected JSON admin API lives in `app/routes/admin_api.py`.
+- A separate Next.js dashboard exists in `dashboard/`, consuming the admin API.
+- An autonomous agent engine lives under `app/services/agent/`.
+- Analytics, recommendations, customer profiling, and automation live under `app/services/intelligence/`.
+
+Primary business domains implemented
+- Sales:
+  product catalog browsing, product details, recommendations, vendor catalog management, promotions, offers, events, broadcasts.
+- Order management:
+  cart building, address capture, checkout, order status retrieval, vendor order status updates, vendor notifications, delivery-progress nudges.
+- Customer support:
+  support ticket creation, support ticket updating, ticket resolution, vendor notification of support issues, recovery follow-ups.
+
+Primary runtime roles
+- Customer:
+  browses products, builds cart, shares address, places order, asks order status, raises support issues, receives support and automated follow-ups.
+- Vendor:
+  receives order notifications, updates order status by replying in natural language, manages products and offers, updates business profile, sends broadcasts, resolves support tickets.
+- Manager:
+  signs into HTML dashboard, manages businesses and products, views recent orders.
+- Admin token holder:
+  uses JSON APIs for business listing, orders, usage, support, traces, and dashboard analytics.
+
+===============================================================================
+2. BOOT PROCESS AND APP STARTUP
+===============================================================================
+
+Startup sequence in `app/main.py`
+- Reads `.env` manually with `load_env_file()` before app creation.
+- Initializes Mongo-backed DB via `init_db()`.
+- Creates FastAPI app titled `WhatsApp Conversational Commerce Agent`, version `2.0.0`.
+- Adds SlowAPI rate limiting middleware.
+- Adds session middleware for manager login.
+- Mounts routers:
+  `/onboard`
+  `/webhook/whatsapp`
+  manager HTML routes
+  admin JSON API routes
+- On startup:
+  initializes Mongo DB handle into `app.state.mongo_db`
+  seeds manager user if manager env credentials exist
+  starts one daemon automation thread running `run_automation_cycle()`
+- Exposes `/health` returning `{"status": "ok"}`.
+
+Operational implication
+- The backend assumes Mongo is configured and reachable at import/startup time.
+- The automation thread is always started once when the app starts.
+
+===============================================================================
+3. ENVIRONMENT AND CONFIGURATION
+===============================================================================
+
+Expected environment variables from `.env.example`
+- OpenAI/Gemini keys and models
+- `LLM_PROVIDER`
+- Twilio credentials and WhatsApp sender number
+- MongoDB URI and DB name
+- default business metadata
+- manager credentials
+- admin token
+- debug flag
+
+Observed current `.env` behavior
+- `LLM_PROVIDER=auto`
+- OpenAI key is empty
+- Gemini key is present
+- Twilio SID/token/from-number are present
+- MongoDB Atlas URI is present
+- Manager email/password are present
+- Admin token is present
+- `DEBUG=false`
+
+Debug/security note
+- Real credentials are stored directly in `.env`.
+- This is not a code-path bug, but it is an operational risk and worth flagging for debugging/ops hygiene.
+- This report intentionally does not repeat those secret values.
+
+Runtime provider selection
+- LLM provider selection is implemented in `app/services/llm.py`.
+- If `LLM_PROVIDER=auto`, it prefers providers using `LLM_PROVIDER_PRIORITY`, defaulting to `openai,gemini`.
+- Because OpenAI key is empty and Gemini key is present, the effective live provider is Gemini unless code/path forces otherwise.
+- Provider backoff is implemented for rate/quota failures.
+
+Twilio behavior
+- `send_whatsapp_message()` uses direct HTTP POST to Twilio REST API.
+- If `DEBUG=true`, it prints the message locally instead of sending.
+- Since current `.env` has `DEBUG=false`, live code would attempt real Twilio sends.
+
+===============================================================================
+4. DATABASE LAYER AND PERSISTENCE MODEL
+===============================================================================
+
+Current active persistence: MongoDB
+- Implemented in `app/db/mongo.py`.
+- `DEFAULT_BUSINESS_ID = "biz_default"`.
+- `get_mongo_client()` requires `MONGODB_URI`.
+- `ensure_seed_data()` seeds:
+  default business
+  default products if the default business has no products
+  collection indexes
+  index cleanup for legacy names
+
+Seeded default business fields
+- `business_id`
+- `slug`
+- `name`
+- `business_type`
+- `description`
+- `address`
+- `hours`
+- `contact_phone`
+- `vendor_phone`
+- `whatsapp_number`
+- `support_details`
+- `policies`
+- `delivery_info`
+- `broadcast_groups`
+- `active`
+- `created_at`
+- `updated_at`
+
+Seeded default products
+- coffee
+- tea
+- juice
+- coke
+- sandwich
+- banana chips
+
+Important Mongo collections used by current code
+- `businesses`
+- `products`
+- `orders`
+- `conversation_state`
+- `chat_history`
+- `conversation_summaries`
+- `customer_learning`
+- `semantic_memory`
+- `agent_traces`
+- `performance_metrics`
+- `tool_policy_stats`
+- `interaction_events`
+- `automation_log`
+- `automation_runs`
+- `vendor_notification_queue`
+- `promotions`
+- `events`
+- `support_tickets`
+- `customer_profiles`
+- `manager_users`
+
+Important indexes created
+- businesses:
+  unique on `business_id`
+  unique on `slug`
+  unique sparse on `vendor_phone`
+  unique sparse on `whatsapp_number`
+- products:
+  unique on `(business_id, name)`
+- orders:
+  unique on `order_id`
+  `(business_id, customer_phone)`
+  `(business_id, created_at desc)`
+- conversation_state:
+  unique on `(business_id, phone)`
+- support_tickets:
+  unique on `(business_id, ticket_id)`
+  `(business_id, customer_phone)`
+- several time-sorted indexes for history, metrics, events, traces
+
+Observed live Mongo access from this environment
+- Mongo is configured in `.env`.
+- A direct Python connectivity attempt timed out after 20 seconds from this sandbox.
+- Therefore live collection counts/samples from Mongo could not be inspected here.
+- This means current code expects Mongo, but this report cannot confirm current remote DB contents from the sandbox.
+
+Legacy SQLite file present: `commerce.db`
+- This is not used by the current FastAPI service code.
+- It still contains historical tables and data and is useful for local debugging context.
+
+Observed SQLite schema
+- `chat_history`
+- `conversation_state`
+- `orders`
+- `products`
+- `vendor_notification_queue`
+
+Observed SQLite counts
+- `chat_history`: 0
+- `conversation_state`: 2
+- `orders`: 4
+- `products`: 5
+- `vendor_notification_queue`: 0
+
+Observed SQLite sample implications
+- There are historical customer/vendor conversations.
+- There are historical orders, including accepted and pending statuses.
+- There is at least one bad historical order where:
+  item name is `drinks`
+  total is `0.0`
+  address is actually a conversational correction message
+- This is evidence of an earlier checkout/address parsing bug or older implementation mismatch.
+
+===============================================================================
+5. ROUTING LAYER
+===============================================================================
+
+5.1 WhatsApp webhook route
+File
+- `app/routes/whatsapp.py`
+
+Behavior
+- Expects Twilio form fields:
+  `Body`
+  `From`
+  `To`
+  `MessageSid`
+- Rate limit: `10/minute`
+- If `ENV=prod`, validates Twilio signature using `RequestValidator`
+- Rejects missing `Body` or `From`
+- Normalizes sender and recipient with `normalize_phone()`
+- Deduplicates webhook calls for 180 seconds using:
+  `MessageSid`, or fallback `sender|lower(body)`
+- Resolves business by:
+  1. matching Twilio recipient against a business `whatsapp_number`
+  2. otherwise matching sender against `vendor_phone`
+- Determines role:
+  `vendor` if sender equals business vendor phone
+  else `customer`
+- Calls `process_incoming_message()`
+- Sanitizes reply with `safe_user_facing_text()`
+- Sends reply back via Twilio using the business-specific `whatsapp_number` as sender
+
+Debug implications
+- Twilio auth token is required at import time. If missing, importing this route raises immediately.
+- Business resolution can fail if the incoming numbers do not exactly match normalized stored values.
+- Duplicate webhook suppression may hide repeated deliveries during testing.
+
+5.2 Manager HTML dashboard
+File
+- `app/routes/admin.py`
+
+Behavior
+- Session-based login at `/manager/login`
+- Session cookie uses `MANAGER_SESSION_SECRET`
+- Seeds manager user from env if needed
+- Dashboard shows:
+  business list
+  business editor
+  product editor
+  recent orders table
+- Can:
+  create business
+  update business
+  soft-delete business
+  create product
+  update product
+
+Debug implications
+- Manager auth is entirely DB/env based, no OAuth.
+- Product creation and update are direct wrappers over service calls.
+- Recent orders shown are raw Mongo rows, last 12, sorted by `created_at desc`.
+
+5.3 Admin JSON API
+File
+- `app/routes/admin_api.py`
+
+Protected routes requiring `x-admin-token`
+- `POST /admin/business`
+- `GET /admin/businesses`
+- `PUT /admin/business/{business_id}`
+- `DELETE /admin/business/{business_id}`
+- `GET /admin/orders`
+- `GET /admin/usage`
+- `GET /admin/support`
+- `GET /admin/agent-traces`
+
+Dashboard analytics route
+- `GET /admin/dashboard/{business_id}`
+- Important: this route does NOT require admin token, unlike the rest of the admin API.
+- It returns:
+  `metrics`
+  `top_products`
+  `insights`
+
+Debug hotspot
+- `/admin/dashboard/{business_id}` being unprotected is an implementation inconsistency.
+
+5.4 Onboarding route
+File
+- `app/routes/onboarding.py`
+
+Behavior
+- `POST /onboard/`
+- Accepts `name` and `phone`
+- Creates a business where both `whatsapp_number` and `vendor_phone` are set to the same phone
+
+Debug implications
+- This is a simplified onboarding path.
+- It assumes vendor phone and business WhatsApp channel are identical.
+
+===============================================================================
+6. SALES IMPLEMENTATION
+===============================================================================
+
+6.1 Product model behavior
+- Products are stored per business.
+- Core fields:
+  `business_id`
+  `name` normalized
+  `display_name`
+  `price`
+  `unit`
+  `category`
+  `description`
+  `tags`
+  `attributes`
+  `active`
+  `offer_price`
+  `offer_until`
+  timestamps
+
+Name normalization
+- `normalize_product_name()` lowercases and compacts whitespace.
+- Special aliases:
+  anything containing banana + chip => `banana chips`
+  `soft drink` => `cold drink`
+
+Category assignment
+- Explicit category if provided
+- Else inferred heuristically:
+  drink
+  footwear
+  clothing
+  snack
+  fallback `other`
+
+Catalog search
+- `get_product_catalog()` supports:
+  category filter
+  text search across display name, normalized name, description, tags
+  price range
+  tags
+  sorting
+  capped limit
+
+Single-product lookup
+- `get_product_details()` tries:
+  exact normalized name
+  exact display_name regex
+  exact tag regex
+
+Sales-facing agent tools
+- `search_catalog`
+- `get_product_details`
+- `recommend_products`
+- vendor tools:
+  `manage_product`
+  `create_offer`
+  `create_promotion`
+  `create_event`
+  `update_business_profile`
+  `send_broadcast`
+
+6.2 Product ranking and recommendation
+Files
+- `app/services/agent/ranking.py`
+- `app/services/intelligence/recommendations.py`
+
+Ranking signals
+- semantic query score from token overlap
+- customer product affinity
+- click signals
+- favorite-product boost
+- popularity score if present in product docs
+- freshness from `updated_at`
+- exploration boost for untouched products
+
+Recommendation engine behavior
+- Starts from ranked catalog candidates.
+- Re-scores top results using multi-armed-bandit-like stats from `recommendation_stats`:
+  exploitation from clicks/orders over shown count
+  exploration from low-shown products
+- Returns top 5.
+
+Recommendation feedback tracking
+- `shown`
+- `clicked`
+- `ordered`
+
+Sales messaging behavior
+- Customer replies can be English, Manglish, or Malayalam.
+- Recommendation messages include:
+  base price
+  note for affinity or exploration when applicable
+
+Broadcast behavior
+- Targets are union of:
+  customer phones from orders
+  customer phones from conversation_state with role customer
+  business `broadcast_groups`
+- Each target is sent one WhatsApp message via Twilio wrapper.
+
+6.3 Promotions and events
+Files
+- `app/services/vendor.py`
+
+Promotion model
+- `promotion_id`
+- `title`
+- `scope`: global/category/product
+- `target`
+- `discount_type`: percent/flat
+- `discount_value`
+- start/end times
+- optional `broadcast_text`
+- active flag
+
+Event model
+- `event_id`
+- `title`
+- `description`
+- optional promotion metadata
+- optional `broadcast_text`
+
+Active pricing adjustment computation
+- Active promotions are collected.
+- Active events with discount metadata are converted into pricing adjustments.
+- Order pricing chooses the best discount for each product.
+
+===============================================================================
+7. ORDER MANAGEMENT IMPLEMENTATION
+===============================================================================
+
+7.1 Order model
+File
+- `app/models/order.py`
+
+Order fields
+- `orderId`
+- `businessId`
+- `customerPhone`
+- `items` as list of `OrderItem(name, qty)`
+- `total`
+- `status`
+- `address`
+- `createdAt`
+
+Allowed statuses
+- `pending`
+- `accepted`
+- `out_for_delivery`
+- `delivered`
+- `rejected`
+
+7.2 Cart and checkout flow
+Primary logic files
+- `app/services/agent/tools.py`
+- `app/services/order.py`
+- `app/services/agent/memory.py`
+- `app/services/agent/policy.py`
+
+Cart state shape in conversation state
+- `cart.items`
+- `cart.address`
+- `cart.updated_at`
+
+Workflow state shape
+- `workflow.name`
+- `workflow.stage`
+- `workflow.required_slots`
+- `workflow.filled_slots`
+- `workflow.next_question`
+
+Relevant workflow stages
+- empty/idle
+- `collect_address`
+- `ready_to_checkout`
+
+Cart management behavior
+- `manage_cart` supports:
+  add
+  remove
+  replace
+  set
+  view
+- If explicit items are not supplied, it tries to parse items from raw query.
+- Parsing strategy:
+  1. numeric-token heuristic
+  2. ranking products from entire query
+  3. cheap LLM extraction against a shortlist
+- Product resolution then tries:
+  exact product lookup
+  semantic ranking against full catalog
+- If products cannot be confidently matched, tool fails with a customer-facing error listing unmatched items.
+
+Address handling
+- There are two definitions of `_tool_collect_address()` in `app/services/agent/tools.py`.
+- In Python, the later definition overrides the earlier one.
+- Effective live behavior is the later definition.
+- Effective address validation is stricter than the earlier version:
+  rejects known correction phrases
+  requires enough tokens
+  requires address-like keywords or numbers/punctuation patterns
+- If accepted and items already exist, the tool builds an order preview.
+
+Checkout behavior
+- `checkout_order` requires:
+  non-empty cart items
+  non-empty address
+- It creates an order using `create_order()`
+- Sends vendor notification
+- Records `order_created` event
+- Records recommendation feedback as `ordered` for each ordered item
+- Clears cart and workflow
+- Stores `last_order_id`
+- Returns localized order confirmation text
+
+7.3 Order creation and pricing
+File
+- `app/services/order.py`
+
+Order creation sequence
+1. `calculate_order_pricing()`
+2. create `OrderRecord`
+3. update customer profile using preview data
+4. trigger event `order_created`
+5. insert Mongo order document with:
+   `items`
+   `line_items`
+   `total`
+   `status=pending`
+   address
+   timestamps
+
+Pricing logic
+- Uses product catalog map
+- Uses active promotions/events as pricing adjustments
+- For each item:
+  fetch base price
+  apply product `offer_price` if lower
+  apply best active adjustment if better
+  compute line total
+- Invalid or unknown products are silently skipped during pricing
+
+Important order status transitions
+- `pending -> accepted/rejected`
+- `accepted -> out_for_delivery`
+- `out_for_delivery -> delivered`
+
+Vendor actionable order lookup
+- If specific order id given, use it.
+- Else infer latest actionable order based on desired status:
+  for accept/reject: latest pending
+  for out_for_delivery: latest accepted
+  for delivered: latest out_for_delivery
+
+7.4 Order status lookup
+- `get_order_status` tool uses explicit order id if present, otherwise last order id from state, otherwise latest order for the customer.
+- Response includes:
+  order id
+  localized status text
+  item summary
+  total
+
+7.5 Vendor notifications
+Files
+- `app/services/vendor.py`
+
+Behavior
+- New orders trigger vendor notification WhatsApp message.
+- If sending fails:
+  error is printed
+  order JSON is printed
+  payload is queued in `vendor_notification_queue`
+- `retry_failed_notifications()` retries queued notifications.
+
+Debug implication
+- Failed Twilio sends do not lose orders; they queue notification payloads.
+
+===============================================================================
+8. CUSTOMER SUPPORT IMPLEMENTATION
+===============================================================================
+
+8.1 Support ticket creation
+Files
+- `app/services/vendor.py`
+- `app/services/agent/tools.py`
+
+Customer support creation behavior
+- Tool `create_support_ticket` takes issue text.
+- If there is already an unresolved ticket for that customer/business:
+  it updates the latest ticket issue text
+  emits `support_ticket_updated`
+  returns updated-ticket message
+- Otherwise:
+  creates new support ticket
+  emits `support_ticket_created`
+  stores `open_ticket_id` in state
+
+Support categorization
+- default `general`
+- contains `late` or `delay` => `delay`
+- contains `wrong` or `incorrect` => `wrong_item`
+- contains `refund` or `money` => `refund`
+
+Priority assignment
+- `wrong_item` and `refund` => `high`
+- otherwise `normal`
+
+Stored support fields
+- `business_id`
+- `ticket_id`
+- `customer_phone`
+- `order_id`
+- `issue`
+- `category`
+- `priority`
+- `status=open`
+- timestamps
+
+Vendor support notification
+- New support tickets call `_notify_vendor_support_ticket()`
+- That sends a localized WhatsApp message to vendor/contact phone
+
+8.2 Support context inspection
+- `inspect_support_context` fetches latest tickets for:
+  current open ticket id if present
+  else current customer
+  vendor can pass customer phone
+- Also fetches latest order for the customer
+- Writes `active_ticket_id` back into state as `open_ticket_id`
+
+8.3 Support resolution
+- Vendor tool `resolve_support_ticket`
+- Uses explicit ticket id or `open_ticket_id`
+- Marks ticket resolved
+- Stores resolution notes and resolved timestamp
+- Sends customer resolution WhatsApp message
+- Emits `support_ticket_resolved`
+- Clears `open_ticket_id` in state
+
+8.4 Support recovery automation
+- Background automation checks unresolved tickets older than 6 hours
+- If spam guard allows and recovery score is high enough:
+  sends a follow-up asking customer to reply if anything changed
+
+===============================================================================
+9. AGENT ENGINE: HOW THE AGENT ACTUALLY WORKS
+===============================================================================
+
+9.1 Main message flow
+Entrypoint
+- `process_incoming_message()` in `app/services/agent/controller.py`
+
+Sequence
+1. Load conversation state with `get_state()`
+2. Try `handle_pending_action()`
+   currently this function is effectively a no-op and always returns `None`
+3. Detect/update language style
+4. Load customer profile
+5. Load learning profile
+6. Run preliminary intent analysis
+7. Select LLM cost tier
+8. Build memory payload:
+   lightweight for safe cheap browse/general cases
+   full otherwise
+9. Update last active
+10. Record `incoming_message` event
+11. Run autonomous agent loop with `run_agent()`
+12. Sanitize final reply
+13. Persist updated state
+14. Save chat history turn
+15. Store semantic memories
+16. Update learning profile
+17. Record sentiment feedback signal
+18. Record `agent_reply` event
+19. Record metrics
+20. Log agent trace
+21. Return reply
+
+9.2 Intent analysis
+File
+- `app/services/agent/policy.py`
+
+Implemented intents
+- `general`
+- `support`
+- `order_status`
+- `cart`
+- `checkout`
+- `browse`
+- `vendor_ops`
+
+Signals used
+- token priors
+- learned token weights from previous interactions
+- prototype similarity phrases
+- workflow stage
+- correction phrases
+- probable-address detection
+- vendor status candidates for vendor role
+- browse-strength heuristics
+- active goal bias
+
+Outputs
+- intent
+- category:
+  support => support
+  order_status/cart/checkout => order
+  otherwise => sales
+- confidence
+- uncertainty
+- vendor status options
+- correction flag
+- probable address flag
+- browse strength
+- complexity
+- needs_llm flag
+
+9.3 Cheap-path logic
+- `cheap_action_allowed()` suppresses LLM usage for safe cases:
+  greetings/general
+  clean browse requests
+  strong vendor status messages
+  address capture during collect_address
+  final yes/confirm during ready_to_checkout
+
+Effect
+- Low-cost deterministic paths exist for common turns.
+- The agent does not always call the LLM.
+
+9.4 Strategy building
+- `build_strategy()` computes:
+  mode
+  goal
+  priority
+  upsell allowance
+  support guard
+  workflow bias
+  service level
+  autonomy level
+  personalization weight
+  exploration amount
+  response style
+  planning horizon
+  goal persistence
+  feedback bias
+
+Important support rule
+- For support mode, selling/upsell is disabled.
+
+9.5 Planner behavior
+Files
+- `app/services/agent/planner.py`
+- `app/services/agent/prompts.py`
+
+Planner order of operations
+1. Reuse persisted plan step from `goal_tracking.current_plan` if available and still valid
+2. Rank tools
+3. If cheap path allowed, return micro-decision without LLM
+4. Else build planner prompt and call `call_agent_llm()`
+5. If LLM fails, use ranked fallback
+
+Planner prompt includes
+- user role/phone/business
+- strategy
+- analysis
+- memory bundle
+- available tools
+- tool shortlist
+- scratchpad observations
+- latest user message
+- requested style
+
+Planner output format
+- JSON only with:
+  thought
+  action
+  arguments
+  message
+  confidence
+  uncertainty
+  goal
+  plan_steps
+
+9.6 Tool execution loop
+File
+- `app/services/agent/main_agent.py`
+
+Loop behavior
+- Max 5 steps.
+- On each step:
+  choose decision
+  validate action
+  execute tool
+  merge state patch
+  merge memory observation
+  update goal tracking
+  reflect on step
+- Stops when:
+  planner chooses `respond`
+  a user-facing successful tool returns final message
+  max steps reached
+- If uncertainty becomes very high and no useful user-facing tool succeeded, agent falls back to clarification message.
+
+9.7 Goal tracking
+Stored in state as `goal_tracking`
+- `goal_type`
+- `goal_text`
+- `status`
+- `current_plan`
+- `completed_steps`
+- `progress_score`
+- `last_updated_at`
+
+Completion behavior
+- Checkout/order_status goals can be marked completed if `last_order_id` exists.
+- Support goal can be marked completed when `resolve_support_ticket` succeeds.
+
+9.8 Memory system
+Files
+- `app/services/agent/memory.py`
+- `app/services/agent/semantic_memory.py`
+
+Memory layers
+- chat history
+- conversation summary
+- state
+- customer profile
+- learning profile
+- recent events
+- business profile summary
+- semantic memory retrieval
+
+Semantic memory behavior
+- Every turn stores:
+  user_turn
+  assistant_turn
+  goal text if present
+- Retrieval is simple cosine similarity over stored token weights.
+
+9.9 Learning and policy adaptation
+File
+- `app/services/agent/learning.py`
+
+Learns/stores
+- intent token patterns
+- vendor status patterns
+- product interest
+- tool success stats
+- tool reward
+- click signals
+- feedback signals
+- recommendation stats
+- preference terms
+- last intent
+- last order signal timestamp
+
+Business-wide tool policy stats
+- `tool_policy_stats` accumulates attempts, successes, and reward totals per tool.
+- Tool ranking uses this to slightly bias tool selection.
+
+9.10 Observability
+Files
+- `app/services/agent/metrics.py`
+- `app/services/agent/observability.py`
+
+Metrics recorded
+- agent_runs
+- agent_steps
+- agent_uncertainty
+- goal_completed
+- order_completion
+- support_handled
+- automation_sent
+- automation_conversion
+
+Trace logging stores
+- analysis
+- strategy
+- goal tracking
+- decisions
+- tools
+- reflections
+- metrics
+- raw customer/vendor message
+
+===============================================================================
+10. AUTOMATION, ANALYTICS, AND INTELLIGENCE
+===============================================================================
+
+10.1 Customer profile computation
+File
+- `app/services/intelligence/customer_profile.py`
+
+Profile fields
+- total orders
+- total spent
+- average order value
+- favorite products
+- category affinity
+- product affinity
+- RFM scores
+- segment
+- cohorts
+- support risk
+- recent intents
+- last order/last active timestamps
+
+Segments
+- `vip`
+- `repeat`
+- `at_risk`
+- `new`
+
+10.2 Analytics
+File
+- `app/services/intelligence/analytics.py`
+
+Business metrics returned
+- total orders
+- total revenue
+- average order value
+- total customers
+- open tickets
+- segment snapshot
+- performance metric summary
+
+Top products
+- derived from line_items if available
+- otherwise falls back to items
+
+10.3 Insight generation
+File
+- `app/services/intelligence/insights.py`
+
+Insight types emitted
+- retention
+- value
+- support
+- product
+- growth
+
+10.4 Automation thread
+File
+- `app/services/intelligence/automation.py`
+
+Cycle frequency
+- env `AUTOMATION_INTERVAL_SECONDS`, default 120 seconds
+
+Automation jobs
+- `process_customers()`
+  reactivation messages for inactive customers with sufficient score
+- `process_orders()`
+  vendor nudges for pending orders
+  customer reassurance for accepted orders
+  delivery message for out_for_delivery orders
+- `process_support_recovery()`
+  follow-ups for unresolved tickets older than 6 hours
+- `process_campaign_feedback()`
+  attributes conversion to recent automation/broadcast events
+
+Spam guard
+- blocks automation if 3 or more recent sends in 24 hours
+- blocks if last send was within 30 minutes
+
+===============================================================================
+11. DASHBOARDS AND OPERATOR INTERFACES
+===============================================================================
+
+11.1 Manager HTML dashboard
+- Built directly in Python with HTML strings.
+- Capabilities:
+  login/logout
+  business create/update/delete
+  product add/update
+  recent order view
+
+11.2 Next.js dashboard
+Files
+- `dashboard/app/page.jsx`
+- `dashboard/package.json`
+
+Stack
+- Next 15.2.4
+- React 19
+
+Behavior
+- Reads admin token from localStorage
+- Loads businesses from `/admin/businesses`
+- Loads dashboard analytics from `/admin/dashboard/{selectedBusiness}`
+- Loads all orders from `/admin/orders`
+- Filters selected business orders client-side
+
+Debug implications
+- The dashboard fetches all orders, not just selected business, then filters in the browser.
+- This is functional but inefficient compared to passing `business_id`.
+- Because `/admin/dashboard/{business_id}` is unprotected in backend code, analytics endpoint is weaker than rest of admin API.
+
+===============================================================================
+12. TESTS AND CURRENT VERIFIED STATUS
+===============================================================================
+
+Executed test suite
+- `python -m unittest tests.test_agent_simulation`
+
+Observed result
+- 15 tests ran
+- all passed
+
+What the tests currently validate
+- goal tracking progresses on successful step
+- persisted plans are reused
+- ambiguous messages do not force address collection
+- recommendation engine adds exploration/exploitation fields
+- greetings map to general intent
+- new-order phrasing does not map to order_status
+- multiple browse phrasings map to browse
+- catalog search can recover to broad listing
+- safe general/browse turns can stay on cheap tier
+- browse fallback prefers catalog search over repair tool
+- main agent stops once a successful user-facing tool provides final reply
+
+Important interpretation
+- The checked-in tests mainly protect planner/policy behavior and browse/order heuristics.
+- They do not validate live Twilio sending, Mongo connectivity, manager routes, or admin API security.
+
+===============================================================================
+13. CURRENT OBSERVED DATA AND RUNTIME NOTES
+===============================================================================
+
+From local environment inspection
+- Mongo is configured but not reachable from this sandbox within 20 seconds.
+- Legacy SQLite still contains historical data.
+
+Observed SQLite historical state
+- 2 conversation_state rows:
+  one customer
+  one vendor
+- 4 orders:
+  one accepted
+  three pending
+- 5 products
+- no queued vendor notifications
+
+Observed historical oddities from SQLite
+- One order has total `0.0`.
+- One order address is a conversational sentence:
+  `No I mean I want drinks. Suggest me drinks`
+- One order includes duplicate product entries instead of consolidated quantities.
+
+Interpretation
+- These rows appear to come from an older SQLite-based implementation or earlier runtime version.
+- They are still useful as evidence of the types of parsing failures this project has encountered.
+- They do not prove the current Mongo-backed code still has the same bug, but they are valuable debugging clues.
+
+===============================================================================
+14. IMPORTANT DEBUG HOTSPOTS AND IMPLEMENTATION INCONSISTENCIES
+===============================================================================
+
+14.1 Duplicate function definitions in `app/services/vendor.py`
+- The file contains duplicate later re-definitions of:
+  `format_offer_preview`
+  `notify_customer_order_update`
+  `generate_vendor_acknowledgement`
+  `_notify_vendor_support_ticket`
+- In Python, the later definitions win.
+- This means earlier behavior in the same file is dead/overridden.
+- Anyone debugging this file must read the bottom-most definitions as the effective ones.
+
+14.2 Duplicate function definitions in `app/services/agent/tools.py`
+- The file contains earlier and later definitions of:
+  `_tool_collect_address`
+  `_tool_search_catalog`
+- The later definitions override the earlier ones.
+- Effective live behavior is the later stricter address validator and the later broader browse-search recovery logic.
+- This file is a major debugging hotspot because reading top-to-bottom naively is misleading.
+
+14.3 `handle_pending_action()` is effectively unused
+- `app/services/agent/executor.py` returns `None`.
+- Pending action infrastructure exists in state but does not currently drive any real workflow.
+
+14.4 Admin dashboard route protection inconsistency
+- Most `/admin/*` routes require `x-admin-token`.
+- `/admin/dashboard/{business_id}` does not.
+
+14.5 Twilio auth token required at import time
+- In `app/routes/whatsapp.py`, missing `TWILIO_AUTH_TOKEN` raises during import.
+- This can break app startup before handling any requests.
+
+14.6 Customer notification style source in vendor order status updates
+- `vendor_update_order_status` calls:
+  `notify_customer_order_update(updated.customerPhone, updated, style_hint=style, ...)`
+- `style` here is the vendor conversation style, not the customer's stored style.
+- Result:
+  customer order-status updates may be sent in the vendor's language style, not the customer's.
+
+14.7 Onboarding route creates business with same WhatsApp and vendor phone
+- `app/services/onboarding.py` uses the same input phone for both.
+- Useful for demos, but simplistic for real multi-number setups.
+
+14.8 Dashboard order loading inefficiency
+- Next dashboard loads all orders then filters client-side.
+
+14.9 Live secrets in `.env`
+- Operational risk, not functional bug.
+- Relevant for debugging because accidental real sends and external API usage can happen.
+
+14.10 Mongo unavailability blocks true runtime verification here
+- Code is Mongo-first.
+- This environment could not verify current remote documents.
+
+===============================================================================
+15. END-TO-END FLOW SUMMARIES
+===============================================================================
+
+15.1 Customer sales browse flow
+1. Customer sends WhatsApp message like "What products do you have?"
+2. Webhook resolves business and role=customer.
+3. Agent controller loads state/profile/learning and analyzes intent.
+4. Cheap path likely classifies as browse.
+5. Planner often chooses `search_catalog`.
+6. Effective search tool handles generic browse specially:
+   no narrow DB search
+   broader ranked listing
+7. Reply is localized and sent through Twilio.
+8. Learning profile is updated with tool outcome and viewed products.
+9. Trace and metrics are recorded.
+
+15.2 Customer order placement flow
+1. Customer asks for items.
+2. Agent chooses `manage_cart`.
+3. Tool parses product/qty, resolves products, updates cart state.
+4. If address missing, workflow goes to `collect_address`.
+5. Customer sends address.
+6. Effective `_tool_collect_address` validates address-like structure.
+7. If valid, workflow moves to `ready_to_checkout` and returns preview.
+8. Customer confirms.
+9. Planner/cheap path chooses `checkout_order`.
+10. Order is created, profile updated, order event recorded.
+11. Vendor notification is attempted.
+12. Cart/workflow are cleared.
+13. Customer receives localized order confirmation.
+
+15.3 Customer order-status flow
+1. Customer asks where order is.
+2. Agent classifies `order_status`.
+3. Tool `get_order_status` uses explicit id, or state `last_order_id`, or latest order.
+4. Customer receives localized summary of status, items, and total.
+
+15.4 Customer support flow
+1. Customer describes issue.
+2. Agent classifies `support`.
+3. Support-oriented strategy disables upsell.
+4. Agent may inspect support context first.
+5. Tool `create_support_ticket` updates existing unresolved ticket or creates a new one.
+6. Vendor support notification is sent.
+7. Ticket id is stored as `open_ticket_id`.
+8. Automation may later follow up if unresolved.
+
+15.5 Vendor order update flow
+1. Vendor replies naturally with terms like accepted, dispatch, delivered.
+2. Webhook resolves role=vendor.
+3. Policy builds vendor status candidates.
+4. Cheap path may skip LLM and choose `vendor_update_order_status`.
+5. Tool finds latest actionable order for target transition.
+6. Transition is validated against allowed status graph.
+7. Order is updated in DB.
+8. Customer gets status update message.
+9. Vendor gets localized acknowledgement.
+
+===============================================================================
+16. FILE-BY-FILE DEBUG MAP
+===============================================================================
+
+Core entry
+- `app/main.py`
+
+Persistence
+- `app/db/mongo.py`
+- `app/db/database.py`
+
+Routes
+- `app/routes/whatsapp.py`
+- `app/routes/admin.py`
+- `app/routes/admin_api.py`
+- `app/routes/onboarding.py`
+
+Business/product/support services
+- `app/services/vendor.py`
+- `app/services/order.py`
+- `app/services/state.py`
+- `app/services/admin.py`
+- `app/services/onboarding.py`
+- `app/services/llm.py`
+- `app/services/broadcast.py`
+
+Agent engine
+- `app/services/agent/controller.py`
+- `app/services/agent/main_agent.py`
+- `app/services/agent/planner.py`
+- `app/services/agent/policy.py`
+- `app/services/agent/tools.py`
+- `app/services/agent/validator.py`
+- `app/services/agent/memory.py`
+- `app/services/agent/learning.py`
+- `app/services/agent/ranking.py`
+- `app/services/agent/reflection.py`
+- `app/services/agent/semantic_memory.py`
+- `app/services/agent/metrics.py`
+- `app/services/agent/observability.py`
+- `app/services/agent/localization.py`
+- `app/services/agent/types.py`
+- `app/services/agent/prompts.py`
+
+Analytics/intelligence
+- `app/services/intelligence/customer_profile.py`
+- `app/services/intelligence/recommendations.py`
+- `app/services/intelligence/analytics.py`
+- `app/services/intelligence/insights.py`
+- `app/services/intelligence/automation.py`
+- `app/services/intelligence/events.py`
+- `app/services/intelligence/strategy.py`
+
+Tests
+- `tests/test_agent_simulation.py`
+
+Operator UI
+- `dashboard/app/page.jsx`
+
+===============================================================================
+17. BOTTOM LINE
+===============================================================================
+
+The current codebase is a Mongo-backed FastAPI WhatsApp commerce agent with:
+- autonomous multi-step agent planning
+- deterministic cheap paths for simple turns
+- product ranking and recommendation logic
+- cart, checkout, and order-status flows
+- support ticketing and vendor resolution flows
+- learning, semantic memory, traces, and performance metrics
+- automation for reactivation, delayed orders, and service recovery
+
+The most important debugging realities right now are:
+- current production logic is Mongo-first, but live Mongo could not be inspected from this sandbox
+- `vendor.py` and `agent/tools.py` both contain duplicate definitions where later functions override earlier ones
+- support, sales, and order flows are all intertwined through the agent planner and shared conversation state
+- a legacy SQLite file still shows historical bad-order patterns and may explain earlier bugs, but it is not the active backend store
+- tests currently pass, but they cover planner/policy heuristics much more than integration behavior
+
+End of report.

@@ -6,7 +6,7 @@ from app.services.agent.localization import contact_reply_prompt, style_text
 from app.services.agent.planner import choose_next_action
 from app.services.agent.policy import analyze_message, build_strategy, select_cost_tier
 from app.services.agent.reflection import reflect_step, summarize_run
-from app.services.agent.tools import execute_tool
+from app.services.agent.tools import execute_tool, is_useful_tool_observation
 from app.services.agent.types import AgentRunResult, PlannerDecision, ToolObservation
 from app.services.agent.validator import validate_action
 from app.services.agent.memory import update_goal_tracking
@@ -119,6 +119,20 @@ async def run_agent(
                 final_reply = observation.error or _fallback_message(analysis["intent"], strategy, style)
             continue
 
+        useful = is_useful_tool_observation(observation)
+        if not useful:
+            _log_main_agent("tool_not_useful", step=step + 1, tool=observation.tool, message_preview=observation.message[:160])
+            analysis["needs_llm"] = True
+            analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.18)
+            working_state["last_tool_gap"] = {
+                "tool": observation.tool,
+                "reason": "not_useful",
+                "query": decision.arguments.get("query") or decision.arguments.get("raw_message") or user_message,
+            }
+            if step == MAX_STEPS - 1 and observation.message:
+                final_reply = observation.message
+            continue
+
         if _should_replan_after_observation(decision, observation, analysis) and step < MAX_STEPS - 1:
             _log_main_agent("tool_replan", step=step + 1, tool=observation.tool, intent=analysis.get("intent"))
             analysis["needs_llm"] = True
@@ -145,7 +159,7 @@ async def run_agent(
     if not final_reply:
         last_error = next((row.error for row in reversed(scratchpad) if row.error), "")
         final_reply = last_error or _fallback_message(analysis["intent"], strategy, style)
-    if analysis.get("uncertainty", 0.0) >= 0.72 and not any(row.ok and not row.internal for row in scratchpad):
+    if analysis.get("uncertainty", 0.0) >= 0.72 and not any(is_useful_tool_observation(row) and not row.internal for row in scratchpad):
         final_reply = _clarification_message(analysis["intent"], style)
 
     working_state["uncertainty"] = {
@@ -218,6 +232,8 @@ def _clarification_message(intent: str, style: str) -> str:
         return style_text(style, "Please describe the issue, what went wrong, and any related order ID.", "Issue enthaanu, enthaanu wrong ayathu, order ID undenkil athum parayu.", "പ്രശ്നം എന്താണ്, എന്താണ് തെറ്റായത്, ബന്ധപ്പെട്ട ഓർഡർ ഐഡി ഉണ്ടെങ്കിൽ അതും പറയൂ.")
     return contact_reply_prompt(style)
 def _should_replan_after_observation(decision: PlannerDecision, observation: ToolObservation, analysis: Dict[str, Any]) -> bool:
+    if not is_useful_tool_observation(observation):
+        return True
     if decision.action == "search_catalog":
         if observation.data.get("recovery_needed"):
             return True

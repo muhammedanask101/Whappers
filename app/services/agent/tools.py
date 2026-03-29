@@ -11,6 +11,7 @@ from app.services.agent.learning import (
     record_tool_outcome,
     update_learning_profile,
 )
+from app.services.agent.extraction import extract_cart_candidates
 from app.services.agent.localization import (
     ask_address_text,
     format_cart_message,
@@ -142,6 +143,8 @@ def rank_tools(
             score += 0.24
         if analysis.get("intent") == "cart" and name in {"inspect_order_context", "manage_cart"}:
             score += 0.26
+        if analysis.get("cart_view_request") and name == "manage_cart":
+            score += 0.42
         if analysis.get("intent") == "checkout" and name in {"inspect_order_context", "collect_address", "checkout_order", "repair_order_context"}:
             score += 0.26
         if analysis.get("is_correction") and name in {"repair_order_context", "inspect_order_context", "collect_address"}:
@@ -154,6 +157,16 @@ def rank_tools(
             score += 0.26
         if analysis.get("intent") == "browse" and name in {"inspect_customer_context", "search_catalog", "recommend_products"}:
             score += 0.18
+        if (state.get("cart") or {}).get("items"):
+            if name in {"inspect_order_context", "manage_cart", "collect_address", "checkout_order"}:
+                score += 0.24
+            if name == "search_catalog" and not analysis.get("intent") == "browse":
+                score -= 0.3
+        if analysis.get("order_workflow_locked"):
+            if name in {"manage_cart", "inspect_order_context", "collect_address", "checkout_order", "repair_order_context"}:
+                score += 0.34
+            elif not meta["internal"]:
+                score -= 0.45
         if analysis.get("uncertainty", 0.0) >= 0.38 and name in {"inspect_memory_context", "inspect_customer_context", "inspect_business_context"}:
             score += 0.18
         if state.get("open_ticket_id") and name in {"inspect_support_context", "resolve_support_ticket"}:
@@ -164,6 +177,33 @@ def rank_tools(
 
     ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
+
+
+def is_useful_tool_observation(observation: ToolObservation) -> bool:
+    if not observation.ok:
+        return False
+    if observation.internal:
+        return True
+    message = str(observation.message or "").strip().lower()
+    if not message and not observation.data:
+        return False
+    generic_phrases = {
+        "tell me a little more and i will handle it.",
+        "tell me what you need help with, and i will handle it.",
+        "tell me what should be fixed in the order.",
+        "i couldn't find an exact match. tell me a category or product type and i will narrow it down.",
+        "i don't have a strong recommendation right now.",
+        "i couldn't find matching products right now.",
+    }
+    if message in generic_phrases:
+        return False
+    if observation.tool == "search_catalog" and not observation.data.get("products"):
+        return False
+    if observation.tool == "recommend_products" and not observation.data.get("products"):
+        return False
+    if observation.tool == "manage_cart" and not observation.data.get("items") and "empty" not in message:
+        return False
+    return True
 
 
 def execute_tool(
@@ -335,7 +375,7 @@ def _tool_inspect_memory_context(args: Dict[str, Any], state: Dict[str, Any], us
     return ToolObservation(tool="inspect_memory_context", ok=True, message="", data={"memories": summarize_for_prompt(rows)}, internal=True)
 
 
-def _tool_search_catalog(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+def _tool_search_catalog_legacy_removed(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
     business_id = user.get("business_id", DEFAULT_BUSINESS_ID)
     query = str(args.get("query") or args.get("search") or "").strip()
     products = get_product_catalog(
@@ -387,12 +427,35 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
     if operation == "view":
         return ToolObservation(tool="manage_cart", ok=True, message=format_cart_message(style, existing_items, cart.get("address", "")), data={"items": existing_items, "products": [item.get("name", "") for item in existing_items]})
 
-    if not raw_items and query:
-        raw_items.extend(_extract_items_from_query(query, business_id=business_id, profile=profile, learning=learning))
+    if query:
+        extracted = extract_cart_candidates(
+            query,
+            llm_fallback=lambda message: _llm_parse_cart_request(message, get_product_catalog(business_id=business_id, limit=100)),
+        )
+        raw_items.extend(extracted.get("items") or [])
 
-    resolved_items, missing = _resolve_items(raw_items, business_id, profile, learning)
-    if missing:
-        return ToolObservation(tool="manage_cart", ok=False, message="", error=style_text(style, f"I could not confidently match these products: {', '.join(missing)}", f"Ivide paranja products clear ayi match cheyyan pattiyilla: {', '.join(missing)}", f"ഇവയിൽ പറഞ്ഞ ഉൽപ്പന്നങ്ങൾ ആത്മവിശ്വാസത്തോടെ പൊരുത്തപ്പെടുത്താൻ കഴിഞ്ഞില്ല: {', '.join(missing)}"), data={"missing_products": missing})
+    normalized_input_items: List[Dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        product_name = str(item.get("product_name") or item.get("name") or item.get("product") or "").strip()
+        if not product_name:
+            continue
+        try:
+            quantity = max(1, int(item.get("quantity") or item.get("qty") or 1))
+        except (TypeError, ValueError):
+            quantity = 1
+        normalized_input_items.append({"product_name": product_name, "quantity": quantity})
+
+    resolved_items, missing = _resolve_items(normalized_input_items, business_id, profile, learning)
+    if not resolved_items:
+        unresolved = missing or [str(item.get("product_name") or "") for item in normalized_input_items if item.get("product_name")]
+        error_text = (
+            f"I could not match these products yet: {', '.join(unresolved)}. Please resend the product name or use JSON with product_name and quantity."
+            if unresolved
+            else "I could not extract any valid cart items from that message. Send the product name with quantity, for example '2 boots'."
+        )
+        return ToolObservation(tool="manage_cart", ok=False, message="", error=style_text(style, error_text, error_text, error_text), data={"missing_products": unresolved})
 
     item_map = {normalize_product_name(item.get("name", "")): int(item.get("qty", 1)) for item in existing_items if item.get("name")}
     if operation == "replace":
@@ -424,12 +487,15 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
     message = format_cart_message(style, updated_items, cart.get("address", ""))
     if updated_items and not cart.get("address"):
         message += "\n" + ask_address_text(style)
+    if missing:
+        warning = f"I could not match: {', '.join(missing)}"
+        message += "\n" + style_text(style, warning, warning, warning)
     for item in resolved_items:
         record_recommendation_feedback(user["phone"], business_id, product_name=str(item.get("name") or ""), event="clicked")
-    return ToolObservation(tool="manage_cart", ok=True, message=message, data={"items": updated_items, "products": [item["name"] for item in updated_items]}, state_patch=state_patch, events=[{"kind": "cart_updated", "payload": {"items": updated_items}}])
+    return ToolObservation(tool="manage_cart", ok=True, message=message, data={"items": updated_items, "products": [item["name"] for item in updated_items], "missing_products": missing, "partial_success": bool(missing)}, state_patch=state_patch, events=[{"kind": "cart_updated", "payload": {"items": updated_items}}])
 
 
-def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+def _tool_collect_address_legacy_removed(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
     cart = dict(state.get("cart") or {"items": [], "address": ""})
     address = str(args.get("address") or args.get("raw_message") or "").strip()
     if len(address.split()) < 3:
@@ -601,40 +667,25 @@ def _tool_send_broadcast(args: Dict[str, Any], state: Dict[str, Any], user: Dict
     return ToolObservation(tool="send_broadcast", ok=True, message=style_text(style, f"Broadcast sent to {result.get('sent', 0)} recipients.", f"Broadcast {result.get('sent', 0)} recipients-kku ayachu.", f"Broadcast {result.get('sent', 0)} പേർക്ക് അയച്ചു."), data=result)
 
 
-def _extract_items_from_query(query: str, business_id: str, profile: Dict[str, Any], learning: Dict[str, Any]) -> List[Dict[str, Any]]:
-    catalog = get_product_catalog(business_id=business_id, limit=100)
-    words = query.replace(",", " ").split()
-    items: List[Dict[str, Any]] = []
-    for index, token in enumerate(words):
-        if not token.isdigit():
-            continue
-        qty = int(token)
-        remainder = " ".join(words[index + 1 : index + 5]).strip()
-        if not remainder:
-            continue
-        ranked = rank_products(remainder, catalog, profile=profile, learning_profile=learning)
-        if ranked and ranked[0]["ranking"]["score"] >= 0.24:
-            items.append({"name": ranked[0]["name"], "qty": qty})
-    if items:
-        return items
-    ranked = rank_products(query, catalog, profile=profile, learning_profile=learning)
-    if ranked and ranked[0]["ranking"]["score"] >= 0.32:
-        return [{"name": ranked[0]["name"], "qty": 1}]
-    return _llm_parse_cart_request(query, catalog)
-
-
 def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[str, Any], learning: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str]]:
     catalog = get_product_catalog(business_id=business_id, limit=100)
+    exact_map = {str(item.get("name") or "").strip().lower(): item for item in catalog}
+    normalized_map = {normalize_product_name(str(item.get("name") or "")): item for item in catalog}
     resolved: List[Dict[str, Any]] = []
     missing: List[str] = []
     for item in items:
-        requested = str(item.get("name") or item.get("product") or "").strip()
+        requested = str(item.get("product_name") or item.get("name") or item.get("product") or "").strip()
         qty = max(1, int(item.get("qty") or item.get("quantity") or 1))
         if not requested:
             continue
-        product = get_product_details(requested, business_id=business_id)
+        lowered = requested.lower()
+        product = exact_map.get(lowered) or get_product_details(requested, business_id=business_id)
         if product:
             resolved.append({"name": product["name"], "qty": qty})
+            continue
+        normalized_product = normalized_map.get(normalize_product_name(requested))
+        if normalized_product:
+            resolved.append({"name": normalized_product["name"], "qty": qty})
             continue
         ranked = rank_products(requested, catalog, profile=profile, learning_profile=learning)
         if ranked and ranked[0]["ranking"]["score"] >= 0.24:
@@ -642,15 +693,6 @@ def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[
         else:
             missing.append(requested)
     return resolved, missing
-
-
-def _format_cart(items: List[Dict[str, Any]], address: str) -> str:
-    if not items:
-        return "Your cart is empty."
-    lines = [f"- {item['name'].title()} x {item['qty']}" for item in items]
-    if address:
-        lines.append(f"Address: {address}")
-    return "Current cart:\n" + "\n".join(lines)
 
 
 def _llm_parse_cart_request(query: str, catalog: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -667,6 +709,13 @@ def _llm_parse_cart_request(query: str, catalog: List[Dict[str, Any]]) -> List[D
         )
     except Exception:
         return []
+    if isinstance(payload, str):
+        try:
+            import json
+
+            payload = json.loads(payload)
+        except Exception:
+            return []
     items = payload.get("arguments", {}).get("items")
     if not isinstance(items, list):
         return []

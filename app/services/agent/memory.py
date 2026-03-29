@@ -212,7 +212,7 @@ def update_goal_tracking(
 ) -> Dict[str, Any]:
     tracking = dict(DEFAULT_STATE["goal_tracking"])
     tracking.update(state.get("goal_tracking") or {})
-    if _should_reset_goal(tracking, intent):
+    if _should_reset_goal(state, tracking, intent, user_message):
         tracking = dict(DEFAULT_STATE["goal_tracking"])
     if not tracking.get("goal_text"):
         tracking["goal_type"] = intent
@@ -234,7 +234,15 @@ def update_goal_tracking(
         tracking["progress_score"] = round(len(completed) / total, 4) if total else 1.0
     if intent in {"checkout", "order_status"} and state.get("last_order_id"):
         tracking["status"] = "completed"
+    if (state.get("workflow") or {}).get("name") == "order_checkout" and tracking.get("status") not in {"completed", "cancelled"}:
+        tracking["status"] = "active"
+        if tracking.get("goal_type") not in {"cart", "checkout"}:
+            tracking["goal_type"] = "checkout"
+        if not tracking.get("goal_text"):
+            tracking["goal_text"] = "Collect missing purchase details and place the order."
     if observation and observation.get("tool") in {"resolve_support_ticket"} and observation.get("ok"):
+        tracking["status"] = "completed"
+    if observation and observation.get("tool") == "checkout_order" and observation.get("ok"):
         tracking["status"] = "completed"
     tracking["last_updated_at"] = utc_now().isoformat()
     return tracking
@@ -297,12 +305,17 @@ def _goal_text(intent: str, user_message: str) -> str:
     return templates.get(intent, user_message[:200] or "Assist the conversation effectively.")
 
 
-def _should_reset_goal(tracking: Dict[str, Any], intent: str) -> bool:
+def _should_reset_goal(state: Dict[str, Any], tracking: Dict[str, Any], intent: str, user_message: str) -> bool:
     if not tracking.get("goal_text"):
         return False
     if tracking.get("status") == "completed":
         return True
+    lowered = str(user_message or "").lower().strip()
+    if any(phrase in lowered for phrase in {"cancel", "cancel order", "stop order", "never mind", "forget it"}):
+        return True
+    if (state.get("workflow") or {}).get("name") == "order_checkout" or (state.get("cart") or {}).get("items") or tracking.get("current_plan"):
+        return False
     current = str(tracking.get("goal_type") or "")
     if intent == "general":
         return False
-    return bool(current and current != intent and not tracking.get("current_plan"))
+    return bool(current and current != intent and tracking.get("status") in {"completed", "cancelled"})

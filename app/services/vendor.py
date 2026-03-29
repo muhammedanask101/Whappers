@@ -959,7 +959,7 @@ def _notify_vendor_support_ticket(ticket: Dict[str, Any], business_id: str = DEF
         print(message)
 
 
-def format_offer_preview(action: Dict[str, Any], style: str) -> str:
+def format_offer_preview_legacy_removed(action: Dict[str, Any], style: str) -> str:
     date = action.get("date") or "open-ended"
     return style_text(
         style,
@@ -969,7 +969,7 @@ def format_offer_preview(action: Dict[str, Any], style: str) -> str:
     )
 
 
-def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_hint: str = "english", business_id: str = DEFAULT_BUSINESS_ID) -> None:
+def notify_customer_order_update_legacy_removed(customer_phone: str, order: OrderRecord, style_hint: str = "english", business_id: str = DEFAULT_BUSINESS_ID) -> None:
     message = style_text(
         style_hint,
         f"Your order {order.orderId} is now {order.status.replace('_', ' ')}.",
@@ -979,7 +979,7 @@ def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_
     send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
 
 
-def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str) -> str:
+def generate_vendor_acknowledgement_legacy_removed(order: OrderRecord, style: str, status: str) -> str:
     human_status = status.replace("_", " ")
     return style_text(
         style,
@@ -989,7 +989,7 @@ def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str)
     )
 
 
-def _notify_vendor_support_ticket(ticket: Dict[str, Any], business_id: str = DEFAULT_BUSINESS_ID) -> None:
+def _notify_vendor_support_ticket_legacy_removed(ticket: Dict[str, Any], business_id: str = DEFAULT_BUSINESS_ID) -> None:
     vendor_phone = _vendor_contact_phone(business_id)
     if not vendor_phone:
         return

@@ -86,6 +86,14 @@ async def process_incoming_message(message: str, user: Dict[str, Any]) -> str:
     updated_state = dict(result.updated_state)
     updated_state["lastLanguage"] = style
     updated_state["lastMessage"] = message
+    if pre_analysis.get("explicit_cancel") and (state.get("workflow") or {}).get("name") == "order_checkout":
+        updated_state["workflow"] = {"name": "", "stage": "", "required_slots": [], "filled_slots": {}, "next_question": ""}
+        updated_state["cart"] = {"items": [], "address": "", "updated_at": updated_state.get("cart", {}).get("updated_at")}
+        updated_state["goal_tracking"] = {
+            **(updated_state.get("goal_tracking") or {}),
+            "status": "cancelled",
+            "current_plan": [],
+        }
     feedback = infer_feedback_signal(message)
     updated_state["feedback"] = feedback
     note_intent(user["phone"], business_id, updated_state, result.intent, float(result.metrics.get("analysis_confidence") or 0.0))
