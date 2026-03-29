@@ -118,27 +118,16 @@ def _select_provider(tier: str = "balanced") -> str:
 
 
 def _dispatch(provider: str, messages: List[Dict[str, str]], *, json_mode: bool, temperature: float, tier: str) -> str:
-    errors: List[str] = []
-    providers = [provider]
-    if provider == "openai" and os.getenv("GEMINI_API_KEY", "").strip():
-        providers.append("gemini")
-    if provider == "gemini" and os.getenv("OPENAI_API_KEY", "").strip():
-        providers.append("openai")
-
-    for candidate in providers:
-        if _provider_in_backoff(candidate):
-            _log_llm("provider_backoff_skip", provider=candidate, tier=tier, wait_seconds=round(PROVIDER_BACKOFF_UNTIL.get(candidate, 0.0) - time.time(), 2))
-            continue
-        try:
-            _log_llm("provider_attempt", provider=candidate, tier=tier, json_mode=json_mode)
-            if candidate == "openai":
-                return _call_openai(messages, json_mode=json_mode, temperature=temperature, tier=tier)
-            return _call_gemini(messages, json_mode=json_mode, temperature=temperature, tier=tier)
-        except Exception as exc:
-            _log_llm("provider_attempt_failed", provider=candidate, tier=tier, error=str(exc))
-            errors.append(str(exc))
-            continue
-    raise RuntimeError("; ".join(errors))
+    if _provider_in_backoff(provider):
+        raise RuntimeError(f"{provider} is temporarily in backoff.")
+    try:
+        _log_llm("provider_attempt", provider=provider, tier=tier, json_mode=json_mode)
+        if provider == "openai":
+            return _call_openai(messages, json_mode=json_mode, temperature=temperature, tier=tier)
+        return _call_gemini(messages, json_mode=json_mode, temperature=temperature, tier=tier)
+    except Exception as exc:
+        _log_llm("provider_attempt_failed", provider=provider, tier=tier, error=str(exc))
+        raise
 
 
 def _call_openai(messages: List[Dict[str, str]], *, json_mode: bool, temperature: float, tier: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
@@ -428,10 +429,24 @@ def _tool_manage_cart(args: Dict[str, Any], state: Dict[str, Any], user: Dict[st
         return ToolObservation(tool="manage_cart", ok=True, message=format_cart_message(style, existing_items, cart.get("address", "")), data={"items": existing_items, "products": [item.get("name", "") for item in existing_items]})
 
     if query:
+        allow_llm_fallback = not bool(state.get("llm_calls_this_run"))
         extracted = extract_cart_candidates(
             query,
-            llm_fallback=lambda message: _llm_parse_cart_request(message, get_product_catalog(business_id=business_id, limit=100)),
+            llm_fallback=(lambda message: _llm_parse_cart_request(message, get_product_catalog(business_id=business_id, limit=100))) if allow_llm_fallback else None,
         )
+        if extracted.get("ambiguous"):
+            return ToolObservation(
+                tool="manage_cart",
+                ok=False,
+                message="",
+                error=style_text(
+                    style,
+                    "I need the quantity paired clearly with each product, for example '2 boots and 3 hoodies'.",
+                    "Oro productinum quantity clear ayi parayu, udaharanam '2 boots and 3 hoodies'.",
+                    "Oro productinum quantity clear ayi parayu, udaharanam '2 boots and 3 hoodies'.",
+                ),
+                data={"warnings": extracted.get("warnings", []), "ambiguous": True},
+            )
         raw_items.extend(extracted.get("items") or [])
 
     normalized_input_items: List[Dict[str, Any]] = []
@@ -762,22 +777,34 @@ def vendor_status_candidates(message: str, business_id: str, learning_profile: O
 
 
 def _looks_like_address(message: str) -> bool:
-    lowered = str(message or "").lower().strip()
+    raw = str(message or "").strip()
+    lowered = raw.lower()
     if not lowered:
         return False
-    if any(phrase in lowered for phrase in {"not my address", "wrong address", "change address", "that's not my address", "thats not my address"}):
+    conversational = {
+        "no",
+        "wait",
+        "i mean",
+        "not that",
+        "wrong",
+        "change it",
+        "hold on",
+        "later",
+        "okay",
+        "ok",
+        "yes",
+    }
+    if lowered in conversational or any(lowered.startswith(prefix) for prefix in {"no ", "wait ", "i mean ", "change "}):
         return False
-    tokens = [token for token in lowered.replace(",", " ").split() if token]
-    if len(tokens) < 4:
+    segments = [segment.strip() for segment in re.split(r"[,\n]", raw) if segment.strip()]
+    tokens = [token for token in re.split(r"\s+", raw) if token.strip()]
+    if len(segments) < 2 and len(tokens) < 2:
         return False
-    acknowledgment = {"yeah", "yes", "ok", "okay", "show", "it", "bill", "sure", "fine"}
-    if len(tokens) <= 5 and sum(1 for token in tokens if token in acknowledgment) >= 2:
-        return False
-    address_keywords = {"road", "rd", "street", "st", "lane", "house", "building", "floor", "flat", "near", "pin", "city", "district", "post", "po", "junction"}
-    has_keyword = any(token in address_keywords for token in tokens)
+    address_keywords = {"road", "rd", "street", "st", "lane", "house", "building", "floor", "flat", "near", "pin", "city", "district", "post", "po", "junction", "p.o", "villa", "block", "kur", "nagar"}
+    has_keyword = any(token.strip(".,").lower() in address_keywords for token in tokens)
     has_number = any(any(ch.isdigit() for ch in token) for token in tokens)
-    punctuation = any(symbol in lowered for symbol in {",", "-", "/"})
-    return has_keyword or (has_number and (punctuation or len(tokens) >= 5))
+    has_capitalized = any(token[:1].isupper() and len(token) > 1 for token in raw.split())
+    return (len(segments) >= 2 or len(tokens) >= 3) and (has_keyword or has_number or has_capitalized)
 
 
 def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:

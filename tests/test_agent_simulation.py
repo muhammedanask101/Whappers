@@ -4,6 +4,7 @@ import asyncio
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 if "pymongo" not in sys.modules:
     pymongo = types.ModuleType("pymongo")
@@ -34,7 +35,7 @@ if "pydantic" not in sys.modules:
 
 from app.services.agent.memory import DEFAULT_STATE, update_goal_tracking
 from app.services.agent.policy import analyze_message, cheap_action_allowed, select_cost_tier
-from app.services.agent.planner import choose_next_action
+from app.services.agent.planner import choose_next_action, should_interrupt_workflow, decide_action_without_llm, route_by_intent, fallback_by_intent
 from app.services.agent.types import PlannerDecision, ToolObservation
 from app.services.agent.tools import execute_tool
 from app.services.intelligence.recommendations import recommend_products
@@ -161,6 +162,14 @@ class AgentSimulationTests(unittest.TestCase):
         analysis = analyze_message("What do you have?", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
         self.assertEqual(analysis["intent"], "browse")
 
+    def test_show_my_order_maps_to_order_status(self) -> None:
+        analysis = analyze_message("show my order", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "order_status")
+
+    def test_confirm_routes_to_checkout_order_in_ready_state(self) -> None:
+        action = route_by_intent("checkout", "confirm", {"workflow": {"stage": "ready_to_checkout"}, "cart": {}, "analysis": {}})
+        self.assertEqual(action, "checkout_order")
+
     def test_see_all_products_maps_to_browse_not_cart(self) -> None:
         analysis = analyze_message("I want to see all the products", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
         self.assertEqual(analysis["intent"], "browse")
@@ -212,6 +221,17 @@ class AgentSimulationTests(unittest.TestCase):
             tools_mod.rank_products = original_rank
             tools_mod.update_learning_profile = original_update_learning
             tools_mod.record_tool_outcome = original_record_tool_outcome
+
+    def test_deterministic_fallback_planner_maps_browse_to_catalog(self) -> None:
+        decision = decide_action_without_llm("browse", {}, "show me products", state={"lastLanguage": "english"}, analysis={})
+        self.assertEqual(decision.action, "search_catalog")
+
+    def test_route_by_intent_maps_show_products(self) -> None:
+        action = route_by_intent("browse", "show me products", {"workflow": {}, "cart": {}, "analysis": {}})
+        self.assertEqual(action, "search_catalog")
+
+    def test_fallback_by_intent_maps_order_status(self) -> None:
+        self.assertEqual(fallback_by_intent("order_status"), "get_order_status")
 
     def test_general_and_browse_turns_are_cheap_when_safe(self) -> None:
         state = {"workflow": {}, "goal_tracking": {}}
@@ -366,6 +386,34 @@ class AgentSimulationTests(unittest.TestCase):
             tools_mod.record_tool_outcome = original_record_tool_outcome
             tools_mod.record_recommendation_feedback = original_feedback
 
+    def test_add_more_keyword_increments_existing_quantity(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [{"name": "hoodies", "display_name": "Hoodies", "price": 500, "offer_price": None}]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": catalog[0] if name.lower().strip() in {"hoodie", "hoodies"} else None
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            observation = execute_tool("manage_cart", {"query": "add 3 more hoodies"}, state={"cart": {"items": [{"name": "hoodies", "qty": 2}], "address": ""}, "workflow": {}}, user={"phone": "1", "role": "customer", "business_id": "biz_default"}, style="english", memory={})
+            self.assertTrue(observation.ok)
+            self.assertEqual(observation.data["items"][0]["qty"], 5)
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
     def test_partial_cart_failure_keeps_valid_item(self) -> None:
         import app.services.agent.tools as tools_mod
 
@@ -467,10 +515,134 @@ class AgentSimulationTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "manage_cart")
 
+    def test_workflow_interrupts_on_product_browse(self) -> None:
+        self.assertTrue(should_interrupt_workflow({"name": "order_checkout", "stage": "collect_address"}, "browse", "show me products"))
+
+    def test_choose_next_action_uses_safety_route_before_planner(self) -> None:
+        import app.services.agent.planner as planner_mod
+
+        original_call_agent_llm = planner_mod.call_agent_llm
+        try:
+            def _raise(*args, **kwargs):
+                raise AssertionError("LLM planner should not run for safety-routed browse")
+
+            planner_mod.call_agent_llm = _raise
+            decision = choose_next_action(
+                user_message="show me products",
+                user={"role": "customer", "phone": "1", "business_id": "biz_default"},
+                state=dict(DEFAULT_STATE),
+                memory_payload={"style": "english"},
+                analysis={"intent": "browse", "category": "sales", "uncertainty": 0.2, "needs_llm": True},
+                strategy={"mode": "sales", "llm_tier": "balanced"},
+                learning_profile={},
+                scratchpad=[],
+                max_steps=3,
+            )
+            self.assertEqual(decision.action, "search_catalog")
+        finally:
+            planner_mod.call_agent_llm = original_call_agent_llm
+
     def test_cheap_path_disabled_for_cart_extraction(self) -> None:
         state = {"workflow": {}, "goal_tracking": {}, "cart": {"items": [], "address": ""}}
         analysis = analyze_message("I want 2 boots", user={"role": "customer"}, state=state, learning_profile={})
         self.assertFalse(cheap_action_allowed(analysis, {"role": "customer"}, state))
+
+    def test_cart_parser_keeps_quantities_separate(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        original_catalog = tools_mod.get_product_catalog
+        original_details = tools_mod.get_product_details
+        original_rank = tools_mod.rank_products
+        original_update_learning = tools_mod.update_learning_profile
+        original_record_tool_outcome = tools_mod.record_tool_outcome
+        original_feedback = tools_mod.record_recommendation_feedback
+        try:
+            catalog = [
+                {"name": "boots", "display_name": "Boots", "price": 800, "offer_price": None},
+                {"name": "hoodies", "display_name": "Hoodies", "price": 500, "offer_price": None},
+            ]
+            tools_mod.get_product_catalog = lambda **kwargs: catalog
+            tools_mod.get_product_details = lambda name, business_id="biz_default": next((row for row in catalog if row["name"] == name.lower().strip()), None)
+            tools_mod.rank_products = lambda query, products, profile=None, learning_profile=None: [{**product, "ranking": {"score": 0.95 if product["name"] in query.lower() else 0.1}} for product in products]
+            tools_mod.update_learning_profile = lambda *args, **kwargs: None
+            tools_mod.record_tool_outcome = lambda *args, **kwargs: None
+            tools_mod.record_recommendation_feedback = lambda *args, **kwargs: None
+            observation = execute_tool("manage_cart", {"query": "I want 2 boots and 3 hoodies"}, state={"cart": {"items": [], "address": ""}, "workflow": {}}, user={"phone": "1", "role": "customer", "business_id": "biz_default"}, style="english", memory={})
+            self.assertTrue(observation.ok)
+            quantities = {item["name"]: item["qty"] for item in observation.data["items"]}
+            self.assertEqual(quantities["boots"], 2)
+            self.assertEqual(quantities["hoodies"], 3)
+        finally:
+            tools_mod.get_product_catalog = original_catalog
+            tools_mod.get_product_details = original_details
+            tools_mod.rank_products = original_rank
+            tools_mod.update_learning_profile = original_update_learning
+            tools_mod.record_tool_outcome = original_record_tool_outcome
+            tools_mod.record_recommendation_feedback = original_feedback
+
+    def test_address_with_house_and_po_is_accepted(self) -> None:
+        import app.services.agent.tools as tools_mod
+
+        observation = tools_mod._tool_collect_address(
+            {"address": "K.T House, Iriya P.O"},
+            {"cart": {"items": [], "address": ""}},
+            {"phone": "1", "role": "customer", "business_id": "biz_default"},
+            "english",
+        )
+        self.assertTrue(observation.ok)
+
+    def test_i_want_to_see_my_order_maps_to_order_status(self) -> None:
+        analysis = analyze_message("I want to see my order", user={"role": "customer"}, state={"workflow": {}, "cart": {"items": []}}, learning_profile={})
+        self.assertEqual(analysis["intent"], "order_status")
+
+    def test_repeated_collect_address_failure_unlocks_workflow(self) -> None:
+        import app.services.agent.main_agent as main_mod
+
+        original_choose_next_action = main_mod.choose_next_action
+        original_execute_tool = main_mod.execute_tool
+        try:
+            call_count = {"value": 0}
+
+            def _decision(**kwargs):
+                call_count["value"] += 1
+                if call_count["value"] <= 2:
+                    return PlannerDecision(action="collect_address", arguments={"address": "no", "raw_message": kwargs["user_message"]}, confidence=0.8)
+                return PlannerDecision(action="manage_cart", arguments={"query": kwargs["user_message"], "raw_message": kwargs["user_message"]}, confidence=0.7)
+
+            def _tool(action, arguments, *args, **kwargs):
+                if action == "collect_address":
+                    return ToolObservation(tool="collect_address", ok=False, message="", error="invalid address")
+                return ToolObservation(tool="manage_cart", ok=True, message="cart updated", data={"items": [{"name": "boots", "qty": 1}]})
+
+            main_mod.choose_next_action = _decision
+            main_mod.execute_tool = _tool
+            result = asyncio.run(
+                main_mod.run_agent(
+                    user_message="I want 1 boots",
+                    user={"role": "customer", "phone": "1", "business_id": "biz_default"},
+                    state={"workflow": {"name": "order_checkout", "stage": "collect_address"}, "cart": {"items": [{"name": "tea", "qty": 1}], "address": ""}, "goal_tracking": {}, "tool_failures": {}},
+                    memory_payload={"style": "english"},
+                    profile={},
+                    learning_profile={},
+                    style="english",
+                )
+            )
+            self.assertEqual(result.reply, "cart updated")
+            self.assertGreaterEqual(result.updated_state.get("tool_failures", {}).get("collect_address", 0), 2)
+        finally:
+            main_mod.choose_next_action = original_choose_next_action
+            main_mod.execute_tool = original_execute_tool
+
+    def test_llm_provider_failure_does_not_retry_other_provider_same_call(self) -> None:
+        import app.services.llm as llm_mod
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "x", "GEMINI_API_KEY": "y", "LLM_PROVIDER_PRIORITY": "openai,gemini"}, clear=False):
+            with patch.object(llm_mod, "_call_openai", side_effect=RuntimeError("quota")) as openai_call:
+                with patch.object(llm_mod, "_call_gemini", side_effect=AssertionError("should not be called")) as gemini_call:
+                    with self.assertRaises(RuntimeError):
+                        llm_mod.call_llm([{"role": "user", "content": "hi"}], json_mode=False, tier="balanced")
+                    self.assertEqual(openai_call.call_count, 1)
+                    self.assertEqual(gemini_call.call_count, 0)
 
 
 if __name__ == "__main__":

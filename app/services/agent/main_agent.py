@@ -17,7 +17,7 @@ def _log_main_agent(event: str, **details: Any) -> None:
     print(f"[agent.main] {event} {normalized}".rstrip())
 
 
-MAX_STEPS = 5
+MAX_STEPS = 3
 INTERNAL_TOOLS = {
     "inspect_customer_context",
     "inspect_order_context",
@@ -47,6 +47,11 @@ async def run_agent(
     working_state = dict(state)
     working_memory = dict(memory_payload)
     final_reply = ""
+    working_state["tool_failures"] = dict(state.get("tool_failures") or {})
+    working_state["llm_calls_this_run"] = 0
+    working_state["last_tool_used"] = str(state.get("last_tool_used") or "")
+    working_state["same_tool_counter"] = int(state.get("same_tool_counter") or 0)
+    working_state["force_deterministic_fallback"] = False
     working_state["goal_tracking"] = update_goal_tracking(working_state, intent=analysis["intent"], user_message=user_message)
 
     for step in range(MAX_STEPS):
@@ -80,11 +85,14 @@ async def run_agent(
         if not valid:
             _log_main_agent("validation_failed", step=step + 1, action=decision.action, error=error)
             scratchpad.append(ToolObservation(tool=decision.action, ok=False, message="", error=error))
+            _record_tool_failure(working_state, decision.action)
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.2)
+            _relax_workflow_if_stuck(working_state, decision.action, analysis, user_message)
             continue
 
         _log_main_agent("tool_execute_start", step=step + 1, action=decision.action)
+        before_state = _progress_snapshot(working_state)
         observation = execute_tool(
             decision.action,
             decision.arguments | {"profile": profile, "learning": learning_profile, "memory": working_memory},
@@ -97,6 +105,8 @@ async def run_agent(
         _log_main_agent("tool_execute_complete", step=step + 1, tool=observation.tool, ok=observation.ok, error=observation.error, message_preview=observation.message[:240])
         _merge_state_patch(working_state, observation.state_patch)
         _merge_memory_from_observation(working_memory, observation)
+        made_progress = _made_progress(decision.action, before_state, working_state, observation)
+        _update_tool_loop_state(working_state, decision.action, made_progress)
         working_state["goal_tracking"] = update_goal_tracking(
             working_state,
             intent=analysis["intent"],
@@ -113,15 +123,24 @@ async def run_agent(
 
         if not observation.ok:
             _log_main_agent("tool_failed", step=step + 1, tool=observation.tool, uncertainty_before=analysis.get("uncertainty"))
+            _record_tool_failure(working_state, observation.tool)
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.22)
+            _relax_workflow_if_stuck(working_state, observation.tool, analysis, user_message)
             if step == MAX_STEPS - 1:
                 final_reply = observation.error or _fallback_message(analysis["intent"], strategy, style)
             continue
 
+        _clear_tool_failures(working_state, observation.tool)
+        if not made_progress and _is_state_mutating_tool(decision.action):
+            _record_tool_failure(working_state, observation.tool)
+            working_state["last_tool_gap"] = {"tool": observation.tool, "reason": "no_progress", "query": decision.arguments.get("query") or decision.arguments.get("raw_message") or user_message}
+            working_state["force_deterministic_fallback"] = True
+            continue
         useful = is_useful_tool_observation(observation)
         if not useful:
             _log_main_agent("tool_not_useful", step=step + 1, tool=observation.tool, message_preview=observation.message[:160])
+            _record_tool_failure(working_state, observation.tool)
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.18)
             working_state["last_tool_gap"] = {
@@ -129,9 +148,13 @@ async def run_agent(
                 "reason": "not_useful",
                 "query": decision.arguments.get("query") or decision.arguments.get("raw_message") or user_message,
             }
-            if step == MAX_STEPS - 1 and observation.message:
-                final_reply = observation.message
+            _relax_workflow_if_stuck(working_state, observation.tool, analysis, user_message)
             continue
+
+        if int(working_state.get("same_tool_counter", 0)) >= 3:
+            working_state["force_deterministic_fallback"] = True
+            if step < MAX_STEPS - 1:
+                continue
 
         if _should_replan_after_observation(decision, observation, analysis) and step < MAX_STEPS - 1:
             _log_main_agent("tool_replan", step=step + 1, tool=observation.tool, intent=analysis.get("intent"))
@@ -211,6 +234,78 @@ def _merge_memory_from_observation(memory: Dict[str, Any], observation: ToolObse
         memory["business_context"] = observation.data
     elif observation.tool == "inspect_memory_context":
         memory["semantic_context"] = observation.data.get("memories", [])
+
+
+def _progress_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "cart": dict(state.get("cart") or {}),
+        "workflow": dict(state.get("workflow") or {}),
+        "last_order_id": state.get("last_order_id", ""),
+        "last_vendor_order_id": state.get("last_vendor_order_id", ""),
+        "open_ticket_id": state.get("open_ticket_id", ""),
+    }
+
+
+def _made_progress(action: str, before: Dict[str, Any], after_state: Dict[str, Any], observation: ToolObservation) -> bool:
+    if not _is_state_mutating_tool(action):
+        return True
+    if action == "manage_cart" and observation.data.get("items"):
+        return True
+    if action == "collect_address" and observation.data.get("address"):
+        return True
+    if action == "checkout_order" and observation.data.get("order_id"):
+        return True
+    after = _progress_snapshot(after_state)
+    return before != after
+
+
+def _is_state_mutating_tool(action: str) -> bool:
+    return action in {"manage_cart", "collect_address", "checkout_order", "create_support_ticket", "resolve_support_ticket", "vendor_update_order_status"}
+
+
+def _update_tool_loop_state(state: Dict[str, Any], tool: str, made_progress: bool) -> None:
+    if state.get("last_tool_used") == tool and not made_progress:
+        state["same_tool_counter"] = int(state.get("same_tool_counter", 0)) + 1
+    else:
+        state["same_tool_counter"] = 0 if made_progress else 1
+    state["last_tool_used"] = tool
+
+
+def _record_tool_failure(state: Dict[str, Any], tool: str) -> None:
+    if not tool:
+        return
+    failures = dict(state.get("tool_failures") or {})
+    failures[tool] = int(failures.get(tool, 0)) + 1
+    state["tool_failures"] = failures
+
+
+def _clear_tool_failures(state: Dict[str, Any], tool: str) -> None:
+    if not tool:
+        return
+    failures = dict(state.get("tool_failures") or {})
+    failures.pop(tool, None)
+    state["tool_failures"] = failures
+
+
+def _relax_workflow_if_stuck(state: Dict[str, Any], tool: str, analysis: Dict[str, Any], user_message: str) -> None:
+    workflow = dict(state.get("workflow") or {})
+    if workflow.get("name") != "order_checkout":
+        return
+    if tool == "collect_address" and (analysis.get("intent") == "cart" or analysis.get("cart_extraction_required")):
+        workflow["stage"] = ""
+        workflow["next_question"] = ""
+        state["workflow"] = workflow
+        analysis["order_workflow_locked"] = False
+        return
+    failures = int((state.get("tool_failures") or {}).get(tool, 0))
+    if failures < 2:
+        return
+    # Repeated failure on the same step should loosen workflow bias so the planner can recover.
+    workflow["stage"] = ""
+    workflow["next_question"] = ""
+    state["workflow"] = workflow
+    state["last_tool_gap"] = {"tool": tool, "reason": "repeated_failure", "query": user_message}
+    analysis["order_workflow_locked"] = False
 
 
 def _fallback_message(intent: str, strategy: Dict[str, Any], style: str) -> str:

@@ -84,6 +84,7 @@ CORRECTION_PHRASES = {
 
 ACKNOWLEDGEMENT_TOKENS = {"yeah", "yes", "ok", "okay", "show", "it", "bill", "fine", "sure", "hmm"}
 CANCEL_PHRASES = {"cancel", "cancel order", "stop order", "never mind", "forget it"}
+ORDER_STATUS_PHRASES = {"my order", "order status", "where is my order", "track order", "track my order", "see my order", "view my order"}
 
 
 def analyze_message(
@@ -141,6 +142,13 @@ def analyze_message(
         scores["cart"] += 0.55
         scores["browse"] += 0.2
         scores["order_status"] -= 0.2
+    if any(phrase in lowered for phrase in ORDER_STATUS_PHRASES):
+        scores["order_status"] += 0.75
+        scores["browse"] -= 0.25
+        scores["support"] -= 0.1
+    if "order" in tokens and any(token in tokens for token in {"see", "view", "track", "status", "where"}):
+        scores["order_status"] += 0.34
+        scores["browse"] -= 0.12
     if any(char.isdigit() for char in lowered):
         scores["cart"] += 0.14
     if structured_cart_payload or cart_extraction_required:

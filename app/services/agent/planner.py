@@ -28,10 +28,17 @@ def choose_next_action(
     scratchpad: List[ToolObservation],
     max_steps: int,
 ) -> PlannerDecision:
+    safety_action = route_by_intent(analysis.get("intent", ""), user_message, {"workflow": state.get("workflow") or {}, "cart": state.get("cart") or {}, "analysis": analysis})
+    if safety_action:
+        return _decision_for_routed_action(safety_action, user_message, state, analysis)
+
+    if should_interrupt_workflow(state.get("workflow") or {}, analysis.get("intent", ""), user_message):
+        state["workflow"] = {"name": "", "stage": "", "required_slots": [], "filled_slots": {}, "next_question": ""}
+        goal_tracking = dict(state.get("goal_tracking") or {})
+        goal_tracking["current_plan"] = []
+        state["goal_tracking"] = goal_tracking
+
     persisted = _planned_decision_from_state(user_message, state, scratchpad, analysis)
-    if persisted:
-        _log_planner("persisted_plan_used", action=persisted.action, confidence=persisted.confidence, rationale=persisted.rationale)
-        return persisted
 
     tool_ranking = rank_tools(
         user=user,
@@ -46,27 +53,31 @@ def choose_next_action(
         _log_planner("cheap_action_allowed", intent=analysis.get("intent"), workflow=(state.get("workflow") or {}).get("stage"))
         return _micro_decision(user_message, user, state, analysis)
 
+    if state.get("force_deterministic_fallback") or int(state.get("llm_calls_this_run", 0)) >= 1:
+        return decide_action_without_llm(analysis.get("intent", "general"), state.get("workflow") or {}, user_message, state=state, analysis=analysis)
+
     messages = build_planner_messages(
         user_message=user_message,
         user=user,
         memory=memory_payload,
         tools=tool_ranking[:10],
         scratchpad=[_observation_to_prompt(row) for row in scratchpad[-max_steps:]],
-        strategy=strategy | {"tool_shortlist": [item["name"] for item in tool_ranking[:6]]},
+        strategy=strategy | {"tool_shortlist": [item["name"] for item in tool_ranking[:6]], "soft_plan_bias": persisted.arguments if persisted else {}, "soft_plan_action": persisted.action if persisted else ""},
         analysis=analysis,
     )
     try:
+        state["llm_calls_this_run"] = int(state.get("llm_calls_this_run", 0)) + 1
         _log_planner("llm_planner_start", tier=strategy.get("llm_tier", "balanced"), top_tools=[item["name"] for item in tool_ranking[:5]], uncertainty=analysis.get("uncertainty"))
         payload = call_agent_llm(messages, tier=strategy.get("llm_tier", "balanced"))
     except Exception:
         _log_planner("llm_planner_failed", tier=strategy.get("llm_tier", "balanced"))
-        return _ranked_fallback(user_message, tool_ranking, state, analysis)
+        return _decision_for_routed_action(fallback_by_intent(analysis.get("intent", "general")), user_message, state, analysis)
 
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except json.JSONDecodeError:
-            return _ranked_fallback(user_message, tool_ranking, state, analysis)
+            return _decision_for_routed_action(fallback_by_intent(analysis.get("intent", "general")), user_message, state, analysis)
 
     decision = PlannerDecision(
         action=str(payload.get("action") or "respond").strip() or "respond",
@@ -131,72 +142,14 @@ def _micro_decision(user_message: str, user: Dict[str, Any], state: Dict[str, An
 
 
 def _ranked_fallback(user_message: str, tool_ranking: List[Dict[str, Any]], state: Dict[str, Any], analysis: Dict[str, Any]) -> PlannerDecision:
-    safe_response = _safe_fallback_response(user_message, state, analysis)
-    if safe_response:
-        return safe_response
-    for tool in tool_ranking:
-        name = tool["name"]
-        if analysis.get("order_workflow_locked") and name not in {"manage_cart", "collect_address", "checkout_order", "inspect_order_context", "repair_order_context"}:
-            continue
-        if name == "repair_order_context" and analysis.get("is_correction"):
-            return PlannerDecision(action=name, arguments={"raw_message": user_message}, rationale="ranked_correction_fallback", confidence=0.42)
-        if name == "manage_cart" and (analysis.get("intent") == "cart" or analysis.get("cart_extraction_required") or analysis.get("cart_view_request")):
-            arguments = {"raw_message": user_message}
-            if analysis.get("cart_view_request"):
-                arguments["operation"] = "view"
-            else:
-                arguments["query"] = user_message
-            return PlannerDecision(action=name, arguments=arguments, rationale="ranked_cart_fallback", confidence=0.46)
-        if name == "collect_address" and analysis.get("probable_address"):
-            return PlannerDecision(action=name, arguments={"address": user_message, "raw_message": user_message}, rationale="ranked_address_fallback", confidence=0.44)
-        if name == "checkout_order" and analysis.get("intent") == "checkout":
-            return PlannerDecision(action=name, arguments={"raw_message": user_message}, rationale="ranked_checkout_fallback", confidence=0.4)
-        if name == "inspect_order_context":
-            return PlannerDecision(action=name, arguments={"raw_message": user_message}, rationale="ranked_fallback_context", confidence=0.35)
-        if analysis.get("confidence", 0.0) >= 0.55 and name in {"search_catalog", "recommend_products", "get_order_status"}:
-            return PlannerDecision(action=name, arguments={"query": user_message, "raw_message": user_message}, rationale="ranked_fallback", confidence=0.28)
-    return PlannerDecision(
-        action="respond",
-        message=style_text(state.get("lastLanguage", "english"), "Please tell me a bit more so I can help properly.", "Kurachu koodi clear ayi parayuo, njan nannayi sahayikkam.", "Kurachu koodi clear ayi parayuo, njan nannayi sahayikkam."),
-        rationale="ranked_fallback_respond",
-        confidence=0.2,
-    )
+    return _decision_for_routed_action(fallback_by_intent(analysis.get("intent", "general")), user_message, state, analysis)
 
 
 def _safe_fallback_response(user_message: str, state: Dict[str, Any], analysis: Dict[str, Any]) -> PlannerDecision | None:
-    lowered = user_message.strip().lower()
-    style = state.get("lastLanguage", "english")
-    if analysis.get("order_workflow_locked"):
-        if analysis.get("cart_view_request") and (state.get("cart") or {}).get("items"):
-            return PlannerDecision(action="manage_cart", arguments={"operation": "view", "raw_message": user_message}, rationale="locked_cart_view", confidence=0.64)
-        if analysis.get("probable_address"):
-            return PlannerDecision(action="collect_address", arguments={"address": user_message, "raw_message": user_message}, rationale="locked_address_progress", confidence=0.66)
-        if analysis.get("intent") in {"cart", "checkout"} or analysis.get("cart_extraction_required"):
-            return PlannerDecision(action="manage_cart", arguments={"query": user_message, "raw_message": user_message}, rationale="locked_cart_progress", confidence=0.62)
-    if analysis.get("intent") == "general" or lowered in {"hi", "hello", "hey", "hey there", "hey theree", "hii"}:
-        return PlannerDecision(
-            action="respond",
-            message=style_text(style, "Hi. Tell me what you want to do: place an order, check an order, or get help.", "Hi. Ningalkku entha venam ennu parayu: order cheyyano, order check cheyyano, allenkil help veeno.", "Hi. Ningalkku entha venam ennu parayu: order cheyyano, order check cheyyano, allenkil help veeno."),
-            rationale="safe_greeting_fallback",
-            confidence=0.6,
-        )
-    if analysis.get("intent") == "cart":
-        return PlannerDecision(action="manage_cart", arguments={"query": user_message, "raw_message": user_message}, rationale="safe_cart_execution", confidence=0.58)
-    if analysis.get("intent") == "browse" and _looks_like_catalog_browse(lowered) and not (state.get("cart") or {}).get("items"):
-        return PlannerDecision(action="search_catalog", arguments={"query": user_message, "raw_message": user_message}, rationale="safe_browse_catalog_fallback", confidence=0.54)
-    return None
+    return _decision_for_routed_action(fallback_by_intent(analysis.get("intent", "general")), user_message, state, analysis)
 
 
 def _planned_decision_from_state(user_message: str, state: Dict[str, Any], scratchpad: List[ToolObservation], analysis: Dict[str, Any]) -> PlannerDecision | None:
-    workflow = state.get("workflow") or {}
-    if analysis.get("order_workflow_locked"):
-        if analysis.get("cart_view_request") and (state.get("cart") or {}).get("items"):
-            return PlannerDecision(action="manage_cart", arguments={"operation": "view"}, rationale="locked_workflow_cart_view", confidence=0.84)
-        if workflow.get("stage") == "collect_address" and analysis.get("probable_address"):
-            return PlannerDecision(action="collect_address", arguments={}, rationale="locked_workflow_collect_address", confidence=0.84)
-        if analysis.get("intent") in {"cart", "checkout"} or analysis.get("cart_extraction_required"):
-            return PlannerDecision(action="manage_cart", arguments={"query": user_message, "raw_message": user_message}, rationale="locked_workflow_manage_cart", confidence=0.78)
-
     goal_tracking = state.get("goal_tracking") or {}
     plan_steps = list(goal_tracking.get("current_plan") or [])
     if not plan_steps:
@@ -223,6 +176,8 @@ def _planned_decision_from_state(user_message: str, state: Dict[str, Any], scrat
 def _should_override_persisted_step(decision: PlannerDecision, analysis: Dict[str, Any]) -> bool:
     if analysis.get("explicit_cancel"):
         return True
+    if analysis.get("intent") == "cart" and decision.action == "collect_address":
+        return True
     if analysis.get("is_correction") and decision.action in {"collect_address", "checkout_order"}:
         return True
     if decision.action == "collect_address" and not analysis.get("probable_address"):
@@ -233,14 +188,86 @@ def _should_override_persisted_step(decision: PlannerDecision, analysis: Dict[st
 
 
 def _enforce_workflow_lock(decision: PlannerDecision, user_message: str, state: Dict[str, Any], analysis: Dict[str, Any]) -> PlannerDecision:
-    if not analysis.get("order_workflow_locked"):
-        return decision
-    allowed = {"manage_cart", "inspect_order_context", "collect_address", "checkout_order", "repair_order_context", "respond"}
-    if decision.action not in allowed:
-        return _safe_fallback_response(user_message, state, analysis) or PlannerDecision(action="manage_cart", arguments={"query": user_message, "raw_message": user_message}, rationale="workflow_lock_override", confidence=0.52)
     if analysis.get("cart_view_request") and decision.action != "manage_cart":
-        return PlannerDecision(action="manage_cart", arguments={"operation": "view", "raw_message": user_message}, rationale="workflow_lock_cart_view", confidence=0.82)
+        return _decision_for_routed_action("manage_cart", user_message, state, analysis, operation="view")
+    if int((state.get("tool_failures") or {}).get(decision.action, 0)) >= 2:
+        return _decision_for_routed_action(fallback_by_intent(analysis.get("intent", "general")), user_message, state, analysis)
     return decision
+
+
+def should_interrupt_workflow(current_workflow: Dict[str, Any], intent: str, message: str) -> bool:
+    if not current_workflow or not current_workflow.get("name"):
+        return False
+    lowered = str(message or "").lower()
+    if intent == "order_status":
+        return True
+    if intent == "browse" or "product" in lowered or "catalog" in lowered:
+        return True
+    if current_workflow.get("stage") == "collect_address" and intent == "cart":
+        return True
+    return False
+
+
+def route_by_intent(intent: str, message: str, context: Dict[str, Any]) -> str | None:
+    lowered = str(message or "").strip().lower()
+    workflow = context.get("workflow") or {}
+    if intent == "browse":
+        return "search_catalog"
+    if intent == "order_status":
+        return "get_order_status"
+    if intent == "checkout" and lowered in {"confirm", "yes", "place order"} and workflow.get("stage") == "ready_to_checkout":
+        return "checkout_order"
+    if intent == "cart":
+        return "manage_cart"
+    if intent == "support":
+        return "inspect_support_context"
+    return None
+
+
+def fallback_by_intent(intent: str) -> str:
+    mapping = {
+        "browse": "search_catalog",
+        "cart": "manage_cart",
+        "checkout": "collect_address",
+        "order_status": "get_order_status",
+        "support": "inspect_support_context",
+    }
+    return mapping.get(intent, "respond")
+
+
+def decide_action_without_llm(intent: str, workflow: Dict[str, Any], message: str, *, state: Dict[str, Any], analysis: Dict[str, Any]) -> PlannerDecision:
+    return _decision_for_routed_action(fallback_by_intent(intent), message, state, analysis)
+
+
+def _decision_for_routed_action(action: str, message: str, state: Dict[str, Any], analysis: Dict[str, Any], operation: str = "") -> PlannerDecision:
+    lowered = str(message or "").strip().lower()
+    if action == "search_catalog":
+        return PlannerDecision(action="search_catalog", arguments={"query": message, "raw_message": message}, rationale="intent_safety_route", confidence=0.86)
+    if action == "manage_cart":
+        arguments: Dict[str, Any] = {"raw_message": message}
+        if operation:
+            arguments["operation"] = operation
+        elif analysis.get("cart_view_request"):
+            arguments["operation"] = "view"
+        else:
+            arguments["query"] = message
+        return PlannerDecision(action="manage_cart", arguments=arguments, rationale="intent_safety_route", confidence=0.86)
+    if action == "get_order_status":
+        return PlannerDecision(action="get_order_status", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.86)
+    if action == "checkout_order":
+        return PlannerDecision(action="checkout_order", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.9)
+    if action == "collect_address":
+        if lowered in {"confirm", "yes", "place order"} and (state.get("workflow") or {}).get("stage") == "ready_to_checkout":
+            return PlannerDecision(action="checkout_order", arguments={"raw_message": message}, rationale="confirm_checkout_route", confidence=0.92)
+        return PlannerDecision(action="collect_address", arguments={"address": message, "raw_message": message}, rationale="intent_fallback_route", confidence=0.78)
+    if action == "inspect_support_context":
+        return PlannerDecision(action="inspect_support_context", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.8)
+    return PlannerDecision(
+        action="respond",
+        message=style_text(state.get("lastLanguage", "english"), "Tell me what you need help with, and I will handle it.", "Entha sahayam venam enn parayu, njan handle cheyyam.", "Entha sahayam venam enn parayu, njan handle cheyyam."),
+        rationale="intent_fallback_respond",
+        confidence=0.4,
+    )
 
 
 def _observation_to_prompt(observation: ToolObservation) -> Dict[str, Any]:
