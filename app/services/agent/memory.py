@@ -4,9 +4,11 @@ from collections import Counter
 from typing import Any, Dict, List
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
+from app.services.llm import call_llm
 from app.services.agent.learning import get_learning_profile, recent_events, tokenize
 from app.services.agent.prompts import summarize_memory_payload
 from app.services.agent.semantic_memory import remember, retrieve, summarize_for_prompt
+from app.services.intelligence.analytics import get_business_metrics
 from app.services.intelligence.insights import generate_insights
 from app.services.intelligence.customer_profile import get_customer_profile
 from app.services.state import append_history, get_conversation_state, get_recent_history, update_last_language
@@ -120,6 +122,7 @@ def get_summary(phone: str, business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str,
 
 def build_memory_bundle(phone: str, business_id: str, state: Dict[str, Any], style: str) -> Dict[str, Any]:
     history = get_history(phone, business_id)
+    compressed_history = _compress_history(history) if len(history) > 10 else history
     summary = get_summary(phone, business_id)
     profile = get_customer_profile(phone, business_id)
     learning = get_learning_profile(phone, business_id)
@@ -129,7 +132,7 @@ def build_memory_bundle(phone: str, business_id: str, state: Dict[str, Any], sty
     automation_rows = list(get_collection("automation_log").find({"business_id": business_id, "phone": phone}).sort("created_at", -1).limit(4))
     vendor_queue_count = get_collection("vendor_notification_queue").count_documents({"business_id": business_id, "status": "pending"})
     return summarize_memory_payload(
-        history=history,
+        history=compressed_history,
         summary=summary,
         profile=profile,
         learning=learning,
@@ -145,11 +148,17 @@ def build_memory_bundle(phone: str, business_id: str, state: Dict[str, Any], sty
             "address": business.get("address"),
         },
         "semantic_context": summarize_for_prompt(semantic_rows),
+        "semantic_customer_memory": {
+            "preferences": _memory_slice(semantic_rows, "preference"),
+            "past_purchases": _memory_slice(semantic_rows, "purchase"),
+            "support_history": _memory_slice(semantic_rows, "support"),
+        },
         "automation": {
             "recent_messages": [_serialize_event(row) for row in automation_rows],
             "pending_vendor_notifications": vendor_queue_count,
         },
         "business_insights": generate_insights(business_id)[:3],
+        "performance_metrics": get_business_metrics(business_id).get("performance", {}),
         "goal_tracking": state.get("goal_tracking", {}),
         "feedback": state.get("feedback", {}),
         "style": style,
@@ -306,6 +315,12 @@ def store_turn_memories(
 ) -> None:
     remember(phone, business_id, kind="user_turn", text=user_message, metadata={"intent": intent})
     remember(phone, business_id, kind="assistant_turn", text=bot_reply, metadata={"intent": intent})
+    if intent in {"browse", "cart"}:
+        remember(phone, business_id, kind="preference", text=user_message, metadata={"intent": intent})
+    if state.get("last_order_id"):
+        remember(phone, business_id, kind="purchase", text=f"Recent order {state.get('last_order_id')}", metadata={"intent": intent})
+    if state.get("open_ticket_id") or intent == "support":
+        remember(phone, business_id, kind="support", text=user_message, metadata={"ticket_id": state.get("open_ticket_id", "")})
     goal_text = str((state.get("goal_tracking") or {}).get("goal_text") or "").strip()
     if goal_text:
         remember(phone, business_id, kind="goal", text=goal_text, metadata={"status": (state.get("goal_tracking") or {}).get("status", "")})
@@ -350,6 +365,33 @@ def _goal_text(intent: str, user_message: str) -> str:
         "vendor_ops": "Help the vendor complete the operational request correctly.",
     }
     return templates.get(intent, user_message[:200] or "Assist the conversation effectively.")
+
+
+def _compress_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    tail = history[-6:]
+    source = history[:-6]
+    if not source:
+        return tail
+    transcript = "\n".join(f"{row.get('role')}: {row.get('content')}" for row in source if row.get("content"))
+    if not transcript.strip():
+        return tail
+    try:
+        summary = call_llm(
+            [
+                {"role": "system", "content": "Summarize the earlier conversation for a commerce agent. Keep preferences, past purchases, unresolved issues, and commitments. Use plain text under 120 words."},
+                {"role": "user", "content": transcript[:4000]},
+            ],
+            tier="cheap",
+        ).strip()
+    except Exception:
+        summary = ""
+    if not summary:
+        return tail
+    return [{"role": "system", "content": f"Compressed history summary: {summary[:800]}"}] + tail
+
+
+def _memory_slice(rows: List[Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
+    return [row for row in summarize_for_prompt(rows) if str(row.get("kind") or "") == kind][:4]
 
 
 def _should_reset_goal(state: Dict[str, Any], tracking: Dict[str, Any], intent: str, user_message: str) -> bool:

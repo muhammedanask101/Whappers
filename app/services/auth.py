@@ -193,36 +193,6 @@ def authenticate_credentials(email: str, password: str) -> Optional[dict[str, An
     return _serialize_user(user)
 
 
-def authenticate_legacy_admin_token(admin_token: str) -> Optional[dict[str, Any]]:
-    expected = get_settings().admin_token
-    if not expected or admin_token != expected:
-        return None
-    seed_auth_entities()
-    fallback_email = (
-        os.getenv("SUPERADMIN_EMAIL", "").strip().lower()
-        or os.getenv("MANAGER_EMAIL", "").strip().lower()
-        or "legacy-admin@local"
-    )
-    document = _get_user_document(fallback_email)
-    if document:
-        return _serialize_user(document)
-    now = utc_now()
-    auto_user = {
-        "user_id": f"user_{secrets.token_hex(8)}",
-        "email": fallback_email,
-        "name": "Legacy Superadmin",
-        "password_hash": hash_password(secrets.token_urlsafe(24)),
-        "role": ROLE_SUPERADMIN,
-        "business_id": None,
-        "active": True,
-        "created_at": now,
-        "updated_at": now,
-    }
-    get_collection("users").update_one({"email": fallback_email}, {"$setOnInsert": auto_user}, upsert=True)
-    document = _get_user_document(fallback_email)
-    return _serialize_user(document) if document else _serialize_user(auto_user)
-
-
 def _build_access_token(user: dict[str, Any]) -> str:
     now = datetime.now(timezone.utc)
     payload = {
@@ -344,7 +314,6 @@ def revoke_refresh_token(response: Response, refresh_token: Optional[str]) -> No
 
 def get_current_user(
     authorization: Optional[str] = Header(default=None),
-    x_admin_token: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     seed_auth_entities()
     bearer = str(authorization or "").strip()
@@ -358,10 +327,6 @@ def get_current_user(
             "role": payload.get("role"),
             "business_id": payload.get("business_id"),
         }
-    if x_admin_token:
-        legacy_user = authenticate_legacy_admin_token(x_admin_token)
-        if legacy_user:
-            return legacy_user
     raise HTTPException(status_code=401, detail="Authentication required.")
 
 

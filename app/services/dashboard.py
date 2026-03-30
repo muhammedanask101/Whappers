@@ -320,6 +320,9 @@ def create_business_with_subscription(payload: dict[str, Any]) -> dict[str, Any]
         support_details=str(payload.get("support_details") or "").strip(),
         policies=str(payload.get("policies") or "").strip(),
         delivery_info=str(payload.get("delivery_info") or "").strip(),
+        messaging_rate_limit_per_minute=int(payload.get("messaging_rate_limit_per_minute") or 30),
+        automation_cooldown_minutes=int(payload.get("automation_cooldown_minutes") or 180),
+        automation_max_messages_per_day=int(payload.get("automation_max_messages_per_day") or 2),
     )
     upsert_subscription(
         business["business_id"],
@@ -346,6 +349,9 @@ def update_business_with_context(business_id: str, payload: dict[str, Any]) -> O
         support_details=payload.get("support_details"),
         policies=payload.get("policies"),
         delivery_info=payload.get("delivery_info"),
+        messaging_rate_limit_per_minute=payload.get("messaging_rate_limit_per_minute"),
+        automation_cooldown_minutes=payload.get("automation_cooldown_minutes"),
+        automation_max_messages_per_day=payload.get("automation_max_messages_per_day"),
         active=payload.get("active"),
     )
     if not updated:

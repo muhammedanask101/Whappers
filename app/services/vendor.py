@@ -1,12 +1,7 @@
-import base64
 import asyncio
 import json
-import os
 import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from pymongo import ReturnDocument
@@ -14,29 +9,21 @@ from pymongo import ReturnDocument
 from app.core.settings import get_settings
 from app.db.mongo import DEFAULT_BUSINESS_ID, generate_id, get_collection, parse_datetime, slugify, to_iso, utc_now
 from app.services.agent.localization import contact_style, status_phrase, style_text
+from app.services.messaging.provider import get_messaging_provider
+from app.services.messaging.service import (
+    enforce_messaging_policy,
+    mark_outbound_failure,
+    mark_outbound_sent,
+    reserve_outbound_message,
+    retryable_dispatches,
+)
+from app.services.messaging.utils import normalize_phone
 from app.models.order import OrderRecord
-from app.services.resilience import ResilientClientError, get_resilient_caller
 
 
 def _log_vendor(event: str, **details: Any) -> None:
     normalized = " ".join(f"{key}={repr(value)}" for key, value in details.items())
     print(f"[vendor] {event} {normalized}".rstrip())
-
-
-def normalize_phone(phone: str) -> str:
-    phone = phone.strip()
-    if not phone:
-        return ""
-    if phone.startswith("whatsapp:"):
-        return phone
-    if phone.startswith("+"):
-        return f"whatsapp:{phone}"
-    digits = re.sub(r"[^\d+]", "", phone)
-    if not digits:
-        return ""
-    if not digits.startswith("+"):
-        digits = f"+{digits}"
-    return f"whatsapp:{digits}"
 
 
 def send_whatsapp_message(
@@ -48,67 +35,72 @@ def send_whatsapp_message(
     notification_type: str = "message",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    settings = get_settings()
     normalized_to = normalize_phone(to)
-    normalized_from = normalize_phone(from_number or settings.twilio_whatsapp_number)
-    _log_vendor("send_whatsapp_message_start", to=normalized_to, from_number=normalized_from, body_preview=body[:240], debug_mode=settings.debug_mode)
-    if settings.debug_mode:
+    business_profile = get_business_profile(business_id)
+    normalized_from = normalize_phone(from_number or str(business_profile.get("whatsapp_number") or ""))
+    provider = get_messaging_provider()
+    dispatch = reserve_outbound_message(
+        business_id=business_id,
+        to=normalized_to,
+        from_number=normalized_from,
+        body=body,
+        notification_type=notification_type,
+        metadata=metadata,
+    )
+    dispatch_doc = dispatch["document"]
+    if dispatch.get("duplicate"):
+        return {
+            "success": str(dispatch_doc.get("status") or "") in {"sent", "delivered", "read"},
+            "duplicate": True,
+            "provider": str(dispatch_doc.get("provider") or "meta"),
+            "message_id": str(dispatch_doc.get("message_id") or ""),
+            "status": str(dispatch_doc.get("status") or ""),
+            "template_required": str(dispatch_doc.get("status") or "") == "template_required",
+        }
+    _log_vendor(
+        "send_whatsapp_message_start",
+        provider=getattr(provider, "provider_name", "meta"),
+        to=normalized_to,
+        from_number=normalized_from,
+        body_preview=body[:240],
+        debug_mode=get_settings().debug_mode,
+    )
+    if get_settings().debug_mode:
         print("=== DEBUG WHATSAPP MESSAGE ===")
         print(f"FROM: {normalized_from}")
         print(f"TO: {normalized_to}")
         print(body)
         print("==============================")
         return {"success": True, "debug": True, "provider": "debug"}
-
-    account_sid = settings.twilio_account_sid
-    auth_token = settings.twilio_auth_token
-    if not all([account_sid, auth_token, normalized_from]):
-        error = "Twilio WhatsApp environment variables are not fully configured."
-        queue_vendor_dispatch(
-            business_id=business_id,
-            target_phone=normalized_to,
-            payload={"body": body, "from_number": normalized_from},
-            notification_type=notification_type,
-            error=error,
-            metadata=metadata,
-        )
-        return {"success": False, "error": error, "queued": True}
-
-    payload = urllib.parse.urlencode({"From": normalized_from, "To": normalized_to, "Body": body}).encode("utf-8")
-    credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
-    request = urllib.request.Request(
-        f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
-        data=payload,
-        headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+    policy = enforce_messaging_policy(
+        business_id=business_id,
+        to=normalized_to,
+        notification_type=notification_type,
+        dispatch_id=dispatch_doc["_id"],
     )
-    def _request() -> Dict[str, Any]:
-        try:
-            _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body))
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                _log_vendor("external_api_response", provider="twilio", sid=data.get("sid"), status=data.get("status"), to=normalized_to)
-                return {"success": True, "provider": "twilio", **data}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}")
-            raise RuntimeError(f"Twilio message send failed: {exc.code} {detail}") from exc
-        except urllib.error.URLError as exc:
-            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason))
-            raise RuntimeError(f"Twilio message send failed: {exc.reason}") from exc
+    if not policy.get("allowed"):
+        return {"success": False, "provider": "meta", "status": policy["reason"], "template_required": policy["reason"] == "template_required"}
 
     try:
-        return get_resilient_caller("twilio-send", max_retries=2).call(_request)
-    except (ResilientClientError, RuntimeError) as exc:
-        queue_vendor_dispatch(
-            business_id=business_id,
-            target_phone=normalized_to,
-            payload={"body": body, "from_number": normalized_from},
-            notification_type=notification_type,
-            error=str(exc),
-            metadata=metadata,
+        result = provider.send_text(normalized_to, body, from_number=normalized_from)
+        mark_outbound_sent(dispatch_doc["_id"], result)
+        _log_vendor(
+            "send_whatsapp_message_complete",
+            provider=result.get("provider", getattr(provider, "provider_name", "")),
+            success=result.get("success"),
+            to=normalized_to,
+            message_id=result.get("message_id") or result.get("sid"),
         )
-        return {"success": False, "error": str(exc), "queued": True}
+        return result
+    except Exception as exc:
+        failure = mark_outbound_failure(dispatch_doc["_id"], exc)
+        _log_vendor(
+            "send_whatsapp_message_failed",
+            provider=getattr(provider, "provider_name", "meta"),
+            to=normalized_to,
+            error=str(exc),
+        )
+        return {"success": False, "error": str(exc), "queued": failure["retryable"], "provider": "meta"}
 
 
 async def send_whatsapp_message_async(
@@ -182,6 +174,9 @@ def create_business(
     support_details: str = "",
     policies: str = "",
     delivery_info: str = "",
+    messaging_rate_limit_per_minute: int = 30,
+    automation_cooldown_minutes: int = 180,
+    automation_max_messages_per_day: int = 2,
 ) -> Dict[str, Any]:
     now = utc_now()
     normalized_whatsapp = normalize_phone(whatsapp_number)
@@ -207,6 +202,9 @@ def create_business(
                     "support_details": support_details.strip(),
                     "policies": policies.strip(),
                     "delivery_info": delivery_info.strip(),
+                    "messaging_rate_limit_per_minute": max(1, int(messaging_rate_limit_per_minute)),
+                    "automation_cooldown_minutes": max(5, int(automation_cooldown_minutes)),
+                    "automation_max_messages_per_day": max(1, int(automation_max_messages_per_day)),
                     "active": True,
                     "updated_at": now,
                 }
@@ -236,6 +234,9 @@ def create_business(
         "support_details": support_details.strip(),
         "policies": policies.strip(),
         "delivery_info": delivery_info.strip(),
+        "messaging_rate_limit_per_minute": max(1, int(messaging_rate_limit_per_minute)),
+        "automation_cooldown_minutes": max(5, int(automation_cooldown_minutes)),
+        "automation_max_messages_per_day": max(1, int(automation_max_messages_per_day)),
         "broadcast_groups": [],
         "active": True,
         "created_at": now,
@@ -260,6 +261,9 @@ def update_business(
     support_details: Optional[str] = None,
     policies: Optional[str] = None,
     delivery_info: Optional[str] = None,
+    messaging_rate_limit_per_minute: Optional[int] = None,
+    automation_cooldown_minutes: Optional[int] = None,
+    automation_max_messages_per_day: Optional[int] = None,
     active: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
     current = get_collection("businesses").find_one({"business_id": business_id})
@@ -291,6 +295,12 @@ def update_business(
         update_fields["policies"] = policies.strip()
     if delivery_info is not None:
         update_fields["delivery_info"] = delivery_info.strip()
+    if messaging_rate_limit_per_minute is not None:
+        update_fields["messaging_rate_limit_per_minute"] = max(1, int(messaging_rate_limit_per_minute))
+    if automation_cooldown_minutes is not None:
+        update_fields["automation_cooldown_minutes"] = max(5, int(automation_cooldown_minutes))
+    if automation_max_messages_per_day is not None:
+        update_fields["automation_max_messages_per_day"] = max(1, int(automation_max_messages_per_day))
     if active is not None:
         update_fields["active"] = bool(active)
 
@@ -522,16 +532,37 @@ def get_business_profile(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, An
 
 def list_orders(business_id: str = DEFAULT_BUSINESS_ID, *, limit: int = 20) -> List[Dict[str, Any]]:
     rows = get_collection("orders").find({"business_id": business_id}).sort("created_at", -1).limit(min(max(int(limit or 20), 1), 100))
-    return [
-        {
-            "order_id": row.get("order_id"),
-            "customer_phone": row.get("customer_phone"),
-            "status": row.get("status"),
-            "total": float(row.get("total", 0.0)),
-            "created_at": to_iso(parse_datetime(row.get("created_at"))),
-        }
-        for row in rows
-    ]
+    return [_serialize_order_summary(row) for row in rows]
+
+
+def list_orders_filtered(
+    business_id: str = DEFAULT_BUSINESS_ID,
+    *,
+    filter_by: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"business_id": business_id}
+    normalized_filter = str(filter_by or "").strip().lower()
+    now = utc_now()
+    if normalized_filter == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        query["created_at"] = {"$gte": start}
+    elif normalized_filter in {"pending", "delivered"}:
+        query["status"] = normalized_filter
+    elif normalized_filter == "date_range":
+        range_query: Dict[str, Any] = {}
+        parsed_from = parse_datetime(date_from)
+        parsed_to = parse_datetime(date_to)
+        if parsed_from:
+            range_query["$gte"] = parsed_from
+        if parsed_to:
+            range_query["$lte"] = parsed_to
+        if range_query:
+            query["created_at"] = range_query
+    rows = get_collection("orders").find(query).sort("created_at", -1).limit(min(max(int(limit or 20), 1), 100))
+    return [_serialize_order_summary(row) for row in rows]
 
 
 def filter_orders(business_id: str = DEFAULT_BUSINESS_ID, *, status: str = "", limit: int = 20) -> List[Dict[str, Any]]:
@@ -539,16 +570,86 @@ def filter_orders(business_id: str = DEFAULT_BUSINESS_ID, *, status: str = "", l
     if status:
         query["status"] = status
     rows = get_collection("orders").find(query).sort("created_at", -1).limit(min(max(int(limit or 20), 1), 100))
+    return [_serialize_order_summary(row) for row in rows]
+
+
+def summarize_sales(business_id: str = DEFAULT_BUSINESS_ID, *, time_window: str = "30d") -> Dict[str, Any]:
+    orders = _orders_for_time_window(business_id, time_window=time_window)
+    revenue = sum(float(row.get("total", 0.0)) for row in orders)
+    unique_customers = {str(row.get("customer_phone") or "") for row in orders if row.get("customer_phone")}
+    return {
+        "time_window": time_window,
+        "orders": len(orders),
+        "revenue": round(revenue, 2),
+        "avg_order_value": round(revenue / max(len(orders), 1), 2) if orders else 0.0,
+        "unique_customers": len(unique_customers),
+        "status_breakdown": _status_breakdown(orders),
+    }
+
+
+def get_top_products_for_window(business_id: str = DEFAULT_BUSINESS_ID, *, time_window: str = "30d", limit: int = 8) -> List[Dict[str, Any]]:
+    orders = _orders_for_time_window(business_id, time_window=time_window)
+    quantities: Dict[str, int] = {}
+    revenue: Dict[str, float] = {}
+    for row in orders:
+        line_items = row.get("line_items") or row.get("items") or []
+        for item in line_items:
+            name = str(item.get("display_name") or item.get("name") or "").strip()
+            if not name:
+                continue
+            qty = int(item.get("qty") or 1)
+            quantities[name] = quantities.get(name, 0) + qty
+            revenue[name] = revenue.get(name, 0.0) + float(item.get("line_total") or item.get("unit_price") or 0.0) * qty
+    ranked = sorted(quantities.items(), key=lambda row: (row[1], revenue.get(row[0], 0.0)), reverse=True)
     return [
         {
-            "order_id": row.get("order_id"),
-            "customer_phone": row.get("customer_phone"),
-            "status": row.get("status"),
-            "total": float(row.get("total", 0.0)),
-            "created_at": to_iso(parse_datetime(row.get("created_at"))),
+            "name": name,
+            "quantity": quantity,
+            "revenue": round(revenue.get(name, 0.0), 2),
         }
-        for row in rows
+        for name, quantity in ranked[: max(1, limit)]
     ]
+
+
+def get_business_health_metrics(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
+    summary = summarize_sales(business_id, time_window="30d")
+    pending_orders = get_collection("orders").count_documents({"business_id": business_id, "status": "pending"})
+    open_tickets = get_collection("support_tickets").count_documents({"business_id": business_id, "status": {"$ne": "resolved"}})
+    automation_runs = list(get_collection("automation_runs").find({"business_id": business_id}).sort("created_at", -1).limit(100))
+    successful_automation = sum(1 for row in automation_runs if row.get("converted"))
+    return {
+        "revenue_last_30d": summary["revenue"],
+        "orders_last_30d": summary["orders"],
+        "avg_order_value": summary["avg_order_value"],
+        "pending_orders": pending_orders,
+        "open_tickets": open_tickets,
+        "automation_success_rate": round(successful_automation / max(len(automation_runs), 1), 4) if automation_runs else 0.0,
+        "top_products": get_top_products_for_window(business_id, time_window="30d", limit=5),
+    }
+
+
+def bulk_update_orders(criteria: Dict[str, Any], action: Dict[str, Any], business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
+    status = str(action.get("status") or "").strip()
+    if not status:
+        raise ValueError("Bulk order update requires a target status.")
+    rows = list_orders_filtered(
+        business_id,
+        filter_by=str(criteria.get("filter") or "date_range"),
+        date_from=str(criteria.get("date_from") or ""),
+        date_to=str(criteria.get("date_to") or ""),
+        limit=min(max(int(criteria.get("limit") or 50), 1), 100),
+    )
+    updated: List[str] = []
+    skipped: List[str] = []
+    for row in rows:
+        if criteria.get("current_status") and str(row.get("status") or "") != str(criteria.get("current_status") or ""):
+            continue
+        order = update_order_status(str(row.get("order_id") or ""), status, business_id=business_id)
+        if order:
+            updated.append(order.orderId)
+        else:
+            skipped.append(str(row.get("order_id") or ""))
+    return {"updated": updated, "skipped": skipped, "target_status": status}
 
 
 def summarize_business(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
@@ -558,6 +659,8 @@ def summarize_business(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]
         "pending_orders": get_collection("orders").count_documents({"business_id": business_id, "status": "pending"}),
         "product_count": get_collection("products").count_documents({"business_id": business_id, "active": True}),
         "support_open": get_collection("support_tickets").count_documents({"business_id": business_id, "status": {"$ne": "resolved"}}),
+        "sales": summarize_sales(business_id, time_window="30d"),
+        "health": get_business_health_metrics(business_id),
     }
 
 
@@ -574,6 +677,9 @@ def update_business_profile(
     policies: Optional[str] = None,
     delivery_info: Optional[str] = None,
     broadcast_groups: Optional[List[str]] = None,
+    messaging_rate_limit_per_minute: Optional[int] = None,
+    automation_cooldown_minutes: Optional[int] = None,
+    automation_max_messages_per_day: Optional[int] = None,
 ) -> Dict[str, Any]:
     update_fields: Dict[str, Any] = {"updated_at": utc_now()}
     if name is not None:
@@ -596,6 +702,12 @@ def update_business_profile(
         update_fields["delivery_info"] = delivery_info.strip()
     if broadcast_groups is not None:
         update_fields["broadcast_groups"] = [normalize_phone(item) for item in broadcast_groups if str(item).strip()]
+    if messaging_rate_limit_per_minute is not None:
+        update_fields["messaging_rate_limit_per_minute"] = max(1, int(messaging_rate_limit_per_minute))
+    if automation_cooldown_minutes is not None:
+        update_fields["automation_cooldown_minutes"] = max(5, int(automation_cooldown_minutes))
+    if automation_max_messages_per_day is not None:
+        update_fields["automation_max_messages_per_day"] = max(1, int(automation_max_messages_per_day))
 
     get_collection("businesses").update_one({"business_id": business_id}, {"$set": update_fields}, upsert=False)
     return get_business_profile(business_id)
@@ -863,7 +975,11 @@ def queue_vendor_dispatch(
 def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
     sent = 0
     queue = get_collection("vendor_notification_queue")
+    now = utc_now()
     for row in queue.find({"business_id": business_id, "status": "pending"}).sort("created_at", 1):
+        next_attempt_at = parse_datetime(row.get("next_attempt_at"))
+        if next_attempt_at and next_attempt_at > now:
+            continue
         try:
             if row.get("order_id"):
                 vendor_phone = _vendor_contact_phone(business_id)
@@ -877,7 +993,7 @@ def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
                     from_number=from_number,
                     business_id=business_id,
                     notification_type="vendor_order_notification",
-                    metadata={"order_id": order.orderId},
+                    metadata={"order_id": order.orderId, "idempotency_key": str(row.get("idempotency_key") or "")},
                 )
             else:
                 result = send_whatsapp_message(
@@ -889,14 +1005,30 @@ def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
                     metadata=dict(row.get("metadata") or {}),
                 )
             if not result.get("success"):
+                if result.get("template_required") or result.get("status") == "rate_limited":
+                    queue.update_one({"_id": row["_id"]}, {"$set": {"status": str(result.get("status") or "template_required"), "updated_at": utc_now()}})
+                    continue
                 raise RuntimeError(str(result.get("error") or "vendor send failed"))
             queue.update_one({"_id": row["_id"]}, {"$set": {"status": "sent", "updated_at": utc_now()}, "$inc": {"attempts": 1}})
             sent += 1
         except Exception as exc:
+            attempts = int(row.get("attempts") or 0) + 1
+            next_retry = utc_now() + timedelta(seconds=min(30 * (2 ** max(0, attempts - 1)), 1800))
             queue.update_one(
                 {"_id": row["_id"]},
-                {"$set": {"last_error": str(exc), "updated_at": utc_now()}, "$inc": {"attempts": 1}},
+                {"$set": {"last_error": str(exc), "updated_at": utc_now(), "next_attempt_at": next_retry}, "$inc": {"attempts": 1}},
             )
+    for row in retryable_dispatches(business_id):
+        result = send_whatsapp_message(
+            str(row.get("to") or ""),
+            str(row.get("body") or ""),
+            from_number=str(row.get("from") or ""),
+            business_id=business_id,
+            notification_type=str(row.get("notification_type") or "message"),
+            metadata=dict(row.get("metadata") or {}) | {"idempotency_key": str(row.get("idempotency_key") or "")},
+        )
+        if result.get("success"):
+            sent += 1
     return sent
 
 
@@ -992,6 +1124,17 @@ def _serialize_product(document: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     }
 
 
+def _serialize_order_summary(document: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "order_id": document.get("order_id"),
+        "customer_phone": document.get("customer_phone"),
+        "status": document.get("status"),
+        "total": float(document.get("total", 0.0)),
+        "created_at": to_iso(parse_datetime(document.get("created_at"))),
+        "updated_at": to_iso(parse_datetime(document.get("updated_at"))),
+    }
+
+
 def _serialize_business(document: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not document:
         return None
@@ -1010,10 +1153,34 @@ def _serialize_business(document: Optional[Dict[str, Any]]) -> Optional[Dict[str
         "policies": document.get("policies", ""),
         "delivery_info": document.get("delivery_info", ""),
         "broadcast_groups": document.get("broadcast_groups", []),
+        "messaging_rate_limit_per_minute": int(document.get("messaging_rate_limit_per_minute", 30)),
+        "automation_cooldown_minutes": int(document.get("automation_cooldown_minutes", 180)),
+        "automation_max_messages_per_day": int(document.get("automation_max_messages_per_day", 2)),
         "active": bool(document.get("active", True)),
         "created_at": to_iso(parse_datetime(document.get("created_at"))),
         "updated_at": to_iso(parse_datetime(document.get("updated_at"))),
     }
+
+
+def _status_breakdown(orders: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in orders:
+        status = str(row.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _orders_for_time_window(business_id: str, *, time_window: str) -> List[Dict[str, Any]]:
+    normalized = str(time_window or "30d").strip().lower()
+    days = 30
+    if normalized.endswith("d") and normalized[:-1].isdigit():
+        days = max(1, int(normalized[:-1]))
+    elif normalized.endswith("w") and normalized[:-1].isdigit():
+        days = max(1, int(normalized[:-1]) * 7)
+    elif normalized.endswith("m") and normalized[:-1].isdigit():
+        days = max(1, int(normalized[:-1]) * 30)
+    cutoff = utc_now() - timedelta(days=days)
+    return list(get_collection("orders").find({"business_id": business_id, "created_at": {"$gte": cutoff}}))
 
 
 def _find_reusable_business(vendor_phone: str, whatsapp_number: str, slug: str) -> Optional[Dict[str, Any]]:

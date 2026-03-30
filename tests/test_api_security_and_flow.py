@@ -66,21 +66,6 @@ if "slowapi" not in sys.modules:
     slowapi_util.get_remote_address = lambda request: "test"
     sys.modules["slowapi.util"] = slowapi_util
 
-if "twilio.request_validator" not in sys.modules:
-    twilio = types.ModuleType("twilio")
-    sys.modules["twilio"] = twilio
-    request_validator = types.ModuleType("twilio.request_validator")
-
-    class _RequestValidator:
-        def __init__(self, *args, **kwargs):
-            return None
-
-        def validate(self, *args, **kwargs):
-            return True
-
-    request_validator.RequestValidator = _RequestValidator
-    sys.modules["twilio.request_validator"] = request_validator
-
 if "pydantic" not in sys.modules:
     pydantic = types.ModuleType("pydantic")
 
@@ -222,23 +207,78 @@ class ApiSecurityAndFlowTests(unittest.TestCase):
         async def _send(*args, **kwargs):
             return {"success": True}
 
+        class _Provider:
+            provider_name = "meta"
+
+            def parse_incoming(self, payload):
+                return {
+                    "from": "whatsapp:+911234567890",
+                    "to": "whatsapp:+919999999999",
+                    "message": "hello",
+                    "type": "text",
+                    "message_id": "wamid.123",
+                }
+
         whatsapp_route._RECENT_WEBHOOKS.clear()
         with patch.object(whatsapp_route, "verify_request", side_effect=_verify):
-            with patch.object(whatsapp_route, "_resolve_business", return_value={"business_id": "biz_1", "name": "Shop", "vendor_phone": "whatsapp:+91123", "whatsapp_number": "whatsapp:+91999"}):
-                with patch.object(whatsapp_route, "_reserve_distributed_dedupe_key", return_value=True):
-                    with patch.object(whatsapp_route, "process_incoming_message", side_effect=_raise):
-                        with patch.object(whatsapp_route, "send_whatsapp_message_async", side_effect=_send) as send_mock:
-                            response = asyncio.run(
-                                whatsapp_route.whatsapp_webhook(
-                                    request=SimpleNamespace(url="https://example.com/webhook/whatsapp", headers={}),
-                                    Body="hello",
-                                    From="whatsapp:+911234567890",
-                                    To="whatsapp:+919999999999",
-                                    MessageSid="SM123",
-                                )
-                            )
+            with patch.object(whatsapp_route, "get_messaging_provider", return_value=_Provider()):
+                with patch.object(whatsapp_route, "_read_incoming_payload", return_value={"entry": []}):
+                        with patch.object(whatsapp_route, "_resolve_business", return_value={"business_id": "biz_1", "name": "Shop", "vendor_phone": "whatsapp:+91123", "whatsapp_number": "whatsapp:+91999"}):
+                            with patch.object(whatsapp_route, "_reserve_distributed_dedupe_key", return_value=True):
+                                with patch.object(whatsapp_route, "process_incoming_message", side_effect=_raise):
+                                    with patch.object(whatsapp_route, "track_last_user_interaction", return_value=None):
+                                        with patch.object(whatsapp_route, "send_whatsapp_message_async", side_effect=_send) as send_mock:
+                                            response = asyncio.run(
+                                                whatsapp_route.whatsapp_webhook(
+                                                    request=SimpleNamespace(url="https://example.com/webhook/whatsapp", headers={"content-type": "application/json"}),
+                                                )
+                                            )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(send_mock.call_args.args[1], "We received your message. Please try again shortly.")
+
+    def test_whatsapp_webhook_meta_payload_reaches_agent_with_normalized_message(self) -> None:
+        async def _verify(_request) -> bool:
+            return True
+
+        async def _process(message, user):
+            self.assertEqual(message, "Need 2 coffees")
+            self.assertEqual(user["phone"], "whatsapp:+919876543210")
+            self.assertEqual(user["role"], "customer")
+            self.assertEqual(user["business_id"], "biz_1")
+            return "Order noted"
+
+        async def _send(*args, **kwargs):
+            return {"success": True, "provider": "meta"}
+
+        class _Provider:
+            provider_name = "meta"
+
+            def parse_incoming(self, payload):
+                return {
+                    "from": "whatsapp:+919876543210",
+                    "to": "whatsapp:+919999999999",
+                    "message": "Need 2 coffees",
+                    "type": "text",
+                    "message_id": "wamid.456",
+                }
+
+        whatsapp_route._RECENT_WEBHOOKS.clear()
+        with patch.object(whatsapp_route, "verify_request", side_effect=_verify):
+            with patch.object(whatsapp_route, "get_messaging_provider", return_value=_Provider()):
+                with patch.object(whatsapp_route, "_read_incoming_payload", return_value={"entry": []}):
+                        with patch.object(whatsapp_route, "_resolve_business", return_value={"business_id": "biz_1", "name": "Shop", "vendor_phone": "whatsapp:+91123", "whatsapp_number": "whatsapp:+91999"}):
+                            with patch.object(whatsapp_route, "_reserve_distributed_dedupe_key", return_value=True):
+                                with patch.object(whatsapp_route, "process_incoming_message", side_effect=_process):
+                                    with patch.object(whatsapp_route, "track_last_user_interaction", return_value=None):
+                                        with patch.object(whatsapp_route, "send_whatsapp_message_async", side_effect=_send) as send_mock:
+                                            response = asyncio.run(
+                                                whatsapp_route.whatsapp_webhook(
+                                                    request=SimpleNamespace(url="https://example.com/webhook/whatsapp", headers={"content-type": "application/json"}),
+                                                )
+                                            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(send_mock.call_args.args[0], "whatsapp:+919876543210")
+        self.assertEqual(send_mock.call_args.args[1], "Order noted")
 
     def test_whatsapp_deduplication_uses_distributed_reservation(self) -> None:
         whatsapp_route._RECENT_WEBHOOKS.clear()

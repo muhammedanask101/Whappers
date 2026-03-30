@@ -320,7 +320,7 @@ def _made_progress(action: str, before: Dict[str, Any], after_state: Dict[str, A
 
 
 def _is_state_mutating_tool(action: str) -> bool:
-    return action in {"manage_cart", "collect_address", "checkout_order", "create_support_ticket", "resolve_support_ticket", "vendor_update_order_status"}
+    return action in {"manage_cart", "collect_address", "checkout_order", "create_support_ticket", "resolve_support_ticket", "vendor_update_order_status", "update_order_status", "bulk_update_orders"}
 
 
 def _update_tool_loop_state(state: Dict[str, Any], tool: str, made_progress: bool) -> None:

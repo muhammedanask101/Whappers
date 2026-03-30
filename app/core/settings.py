@@ -48,10 +48,13 @@ class Settings:
         }
         provider_priority = os.getenv("LLM_PROVIDER_PRIORITY", "openai,gemini").strip()
         self.llm_provider_priority = [item.strip().lower() for item in provider_priority.split(",") if item.strip()]
-        self.twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-        self.twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-        self.twilio_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip()
-        self.admin_token = os.getenv("ADMIN_TOKEN", "").strip()
+        self.meta_graph_api_version = os.getenv("META_GRAPH_API_VERSION", "v19.0").strip() or "v19.0"
+        self.meta_whatsapp_access_token = os.getenv("META_WHATSAPP_ACCESS_TOKEN", "").strip()
+        self.meta_whatsapp_phone_number_id = os.getenv("META_WHATSAPP_PHONE_NUMBER_ID", "").strip()
+        self.meta_whatsapp_verify_token = os.getenv("META_WHATSAPP_VERIFY_TOKEN", "").strip()
+        self.meta_app_secret = os.getenv("META_APP_SECRET", "").strip()
+        self.messaging_rate_limit_per_minute = int(float(os.getenv("MESSAGING_RATE_LIMIT_PER_MINUTE", "30")))
+        self.messaging_retry_max_attempts = int(float(os.getenv("MESSAGING_RETRY_MAX_ATTEMPTS", "4")))
         self.manager_email = os.getenv("MANAGER_EMAIL", "").strip().lower()
         self.manager_password = os.getenv("MANAGER_PASSWORD", "").strip()
         self.automation_interval_seconds = int(float(os.getenv("AUTOMATION_INTERVAL_SECONDS", "120")))

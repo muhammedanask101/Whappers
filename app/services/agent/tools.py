@@ -47,18 +47,23 @@ from app.services.vendor import (
     create_promotion,
     create_support_ticket,
     delete_product,
+    bulk_update_orders,
     generate_vendor_acknowledgement,
     get_active_events,
     get_active_promotions,
+    get_business_health_metrics,
     get_business_profile,
     get_customer_broadcast_targets,
     filter_orders,
+    get_top_products_for_window,
     list_orders,
+    list_orders_filtered,
     get_product_catalog,
     get_product_details,
     normalize_product_name,
     notify_customer_order_update,
     send_vendor_order_notification,
+    summarize_sales,
     summarize_business,
     update_business_profile,
     update_product,
@@ -86,8 +91,13 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "create_support_ticket": {"description": "Create or update a support ticket for an issue.", "roles": {"customer"}, "domains": {"support"}, "internal": False, "base_score": 0.95},
     "recommend_products": {"description": "Recommend next-best products using personalization, exploration, and affinity.", "roles": {"customer"}, "domains": {"sales"}, "internal": False, "base_score": 0.78},
     "vendor_update_order_status": {"description": "Update vendor order status from natural language intent.", "roles": {"vendor"}, "domains": {"order", "support"}, "internal": False, "base_score": 0.96},
-    "list_orders": {"description": "List recent orders for the business.", "roles": {"vendor"}, "domains": {"order"}, "internal": False, "base_score": 0.76},
+    "update_order_status": {"description": "Update a specific order status with planner-selected arguments.", "roles": {"vendor"}, "domains": {"order", "fulfillment"}, "internal": False, "base_score": 0.95},
+    "list_orders": {"description": "List recent or filtered orders for the business.", "roles": {"vendor"}, "domains": {"order", "fulfillment"}, "internal": False, "base_score": 0.82},
     "filter_orders": {"description": "Filter business orders by status.", "roles": {"vendor"}, "domains": {"order"}, "internal": False, "base_score": 0.8},
+    "summarize_sales": {"description": "Summarize sales performance for a time window.", "roles": {"vendor"}, "domains": {"financial", "sales"}, "internal": False, "base_score": 0.84},
+    "get_top_products": {"description": "Get the best-selling products for a time window.", "roles": {"vendor"}, "domains": {"financial", "sales"}, "internal": False, "base_score": 0.8},
+    "bulk_update_orders": {"description": "Apply a status update to multiple orders matching criteria.", "roles": {"vendor"}, "domains": {"order", "fulfillment"}, "internal": False, "base_score": 0.86},
+    "get_business_health_metrics": {"description": "Review conversion, revenue, support, and automation performance metrics.", "roles": {"vendor"}, "domains": {"financial", "sales", "support"}, "internal": False, "base_score": 0.86},
     "summarize_business": {"description": "Summarize business health and analytics.", "roles": {"vendor"}, "domains": {"sales", "order", "support"}, "internal": False, "base_score": 0.72},
     "resolve_support_ticket": {"description": "Resolve an existing support ticket and notify the customer.", "roles": {"vendor"}, "domains": {"support"}, "internal": False, "base_score": 0.92},
     "manage_product": {"description": "Add, update, or deactivate a product.", "roles": {"vendor"}, "domains": {"sales"}, "internal": False, "base_score": 0.84},
@@ -191,6 +201,13 @@ def rank_tools(
             score += business_context_priority * 0.1
         if analysis.get("intent") == "support" and name == "inspect_memory_context":
             score += memory_priority * 0.12
+        vendor_domain = str(analysis.get("vendor_domain") or "")
+        if role == "vendor" and vendor_domain == "operational" and name in {"list_orders", "filter_orders", "update_order_status", "bulk_update_orders", "vendor_update_order_status"}:
+            score += 0.28
+        if role == "vendor" and vendor_domain == "financial" and name in {"summarize_sales", "get_top_products", "get_business_health_metrics", "summarize_business"}:
+            score += 0.3
+        if role == "vendor" and vendor_domain == "fulfillment" and name in {"list_orders", "update_order_status", "bulk_update_orders", "get_business_health_metrics"}:
+            score += 0.26
         if (state.get("cart") or {}).get("items"):
             if name in {"inspect_order_context", "manage_cart", "collect_address", "checkout_order"}:
                 score += 0.24
@@ -268,8 +285,13 @@ def execute_tool(
         "create_support_ticket": _tool_create_support_ticket,
         "recommend_products": _tool_recommend_products,
         "vendor_update_order_status": _tool_vendor_update_order_status,
+        "update_order_status": _tool_update_order_status,
         "list_orders": _tool_list_orders,
         "filter_orders": _tool_filter_orders,
+        "summarize_sales": _tool_summarize_sales,
+        "get_top_products": _tool_get_top_products,
+        "bulk_update_orders": _tool_bulk_update_orders,
+        "get_business_health_metrics": _tool_get_business_health_metrics,
         "summarize_business": _tool_summarize_business,
         "resolve_support_ticket": _tool_resolve_support_ticket,
         "manage_product": _tool_manage_product,
@@ -698,12 +720,26 @@ def _tool_vendor_update_order_status(args: Dict[str, Any], state: Dict[str, Any]
     return ToolObservation(tool="vendor_update_order_status", ok=True, message=generate_vendor_acknowledgement(updated, style, status), data={"order_id": updated.orderId, "status": status}, state_patch={"last_vendor_order_id": updated.orderId})
 
 
+def _tool_update_order_status(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    return _tool_vendor_update_order_status(args, state, user, style)
+
+
 def _tool_list_orders(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
-    rows = list_orders(user.get("business_id", DEFAULT_BUSINESS_ID), limit=int(args.get("limit") or 10))
+    filter_by = str(args.get("filter") or "").strip().lower()
+    if filter_by:
+        rows = list_orders_filtered(
+            user.get("business_id", DEFAULT_BUSINESS_ID),
+            filter_by=filter_by,
+            date_from=str(args.get("date_from") or ""),
+            date_to=str(args.get("date_to") or ""),
+            limit=int(args.get("limit") or 10),
+        )
+    else:
+        rows = list_orders(user.get("business_id", DEFAULT_BUSINESS_ID), limit=int(args.get("limit") or 10))
     if not rows:
         return ToolObservation(tool="list_orders", ok=True, message=style_text(style, "No recent orders found.", "Recent orders onnum illa.", "Recent orders onnum illa."), data={"orders": []})
     lines = [f"{row['order_id']} | {row['status']} | Rs {row['total']:.2f}" for row in rows]
-    return ToolObservation(tool="list_orders", ok=True, message="\n".join(lines), data={"orders": rows})
+    return ToolObservation(tool="list_orders", ok=True, message="\n".join(lines), data={"orders": rows, "filter": filter_by})
 
 
 def _tool_filter_orders(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
@@ -724,6 +760,54 @@ def _tool_summarize_business(args: Dict[str, Any], state: Dict[str, Any], user: 
         f"Open Support: {summary['support_open']}"
     )
     return ToolObservation(tool="summarize_business", ok=True, message=message, data=summary)
+
+
+def _tool_summarize_sales(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    time_window = str(args.get("time_window") or "30d").strip()
+    summary = summarize_sales(user.get("business_id", DEFAULT_BUSINESS_ID), time_window=time_window)
+    message = (
+        f"Sales window: {summary['time_window']}\n"
+        f"Orders: {summary['orders']}\n"
+        f"Revenue: Rs {summary['revenue']:.2f}\n"
+        f"Average order value: Rs {summary['avg_order_value']:.2f}\n"
+        f"Unique customers: {summary['unique_customers']}"
+    )
+    return ToolObservation(tool="summarize_sales", ok=True, message=message, data=summary)
+
+
+def _tool_get_top_products(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    time_window = str(args.get("time_window") or "30d").strip()
+    rows = get_top_products_for_window(user.get("business_id", DEFAULT_BUSINESS_ID), time_window=time_window, limit=int(args.get("limit") or 5))
+    if not rows:
+        return ToolObservation(tool="get_top_products", ok=True, message=style_text(style, "No top products found for that window.", "Aa window-il top products illa.", "Aa window-il top products illa."), data={"products": [], "time_window": time_window})
+    lines = [f"{row['name']} | qty {row['quantity']} | Rs {row['revenue']:.2f}" for row in rows]
+    return ToolObservation(tool="get_top_products", ok=True, message="\n".join(lines), data={"products": rows, "time_window": time_window})
+
+
+def _tool_bulk_update_orders(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    criteria = dict(args.get("criteria") or {})
+    action = dict(args.get("action") or {})
+    try:
+        result = bulk_update_orders(criteria, action, business_id=user.get("business_id", DEFAULT_BUSINESS_ID))
+    except ValueError as exc:
+        return ToolObservation(tool="bulk_update_orders", ok=False, message="", error=str(exc))
+    message = f"Updated {len(result['updated'])} orders to {result['target_status']}."
+    if result["skipped"]:
+        message += f" Skipped {len(result['skipped'])}."
+    return ToolObservation(tool="bulk_update_orders", ok=True, message=message, data=result)
+
+
+def _tool_get_business_health_metrics(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    metrics = get_business_health_metrics(user.get("business_id", DEFAULT_BUSINESS_ID))
+    message = (
+        f"Revenue 30d: Rs {float(metrics['revenue_last_30d']):.2f}\n"
+        f"Orders 30d: {metrics['orders_last_30d']}\n"
+        f"Average order value: Rs {float(metrics['avg_order_value']):.2f}\n"
+        f"Pending orders: {metrics['pending_orders']}\n"
+        f"Open tickets: {metrics['open_tickets']}\n"
+        f"Automation success rate: {float(metrics['automation_success_rate']):.2%}"
+    )
+    return ToolObservation(tool="get_business_health_metrics", ok=True, message=message, data=metrics)
 
 
 def _tool_resolve_support_ticket(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
@@ -783,7 +867,22 @@ def _tool_create_event(args: Dict[str, Any], state: Dict[str, Any], user: Dict[s
 
 
 def _tool_update_business_profile(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
-    profile = update_business_profile(business_id=user.get("business_id", DEFAULT_BUSINESS_ID), name=args.get("name"), business_type=args.get("business_type"), description=args.get("description"), address=args.get("address"), hours=args.get("hours"), contact_phone=args.get("contact_phone"), support_details=args.get("support_details"), policies=args.get("policies"), delivery_info=args.get("delivery_info"), broadcast_groups=args.get("broadcast_groups"))
+    profile = update_business_profile(
+        business_id=user.get("business_id", DEFAULT_BUSINESS_ID),
+        name=args.get("name"),
+        business_type=args.get("business_type"),
+        description=args.get("description"),
+        address=args.get("address"),
+        hours=args.get("hours"),
+        contact_phone=args.get("contact_phone"),
+        support_details=args.get("support_details"),
+        policies=args.get("policies"),
+        delivery_info=args.get("delivery_info"),
+        broadcast_groups=args.get("broadcast_groups"),
+        messaging_rate_limit_per_minute=args.get("messaging_rate_limit_per_minute"),
+        automation_cooldown_minutes=args.get("automation_cooldown_minutes"),
+        automation_max_messages_per_day=args.get("automation_max_messages_per_day"),
+    )
     return ToolObservation(tool="update_business_profile", ok=True, message=style_text(style, "Business profile updated.", "Business profile update cheythu.", "Business profile അപ്‌ഡേറ്റ് ചെയ്തു."), data={"profile": profile})
 
 

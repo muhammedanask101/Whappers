@@ -23,6 +23,10 @@ INTENT_PRIORS = {
     "vendor_ops": {"product", "stock", "offer", "promotion", "broadcast", "business", "update"},
 }
 
+VENDOR_FINANCIAL_MARKERS = {"sales", "revenue", "profit", "top", "best", "analytics", "metrics", "performance", "summary"}
+VENDOR_FULFILLMENT_MARKERS = {"deliver", "delivery", "dispatch", "fulfill", "fulfilled", "pending", "status", "orders", "bulk"}
+VENDOR_OPERATIONAL_MARKERS = {"order", "orders", "update", "manage", "ticket", "support", "catalog", "product"}
+
 BROWSE_MARKERS = {
     "show",
     "see",
@@ -229,6 +233,7 @@ def analyze_message(
     return {
         "intent": intent,
         "category": _category_for_intent(intent),
+        "vendor_domain": _vendor_domain(tokens, lowered, user),
         "confidence": round(calibrated_confidence, 3),
         "uncertainty": round(min(1.0, uncertainty), 3),
         "tokens": tokens,
@@ -261,6 +266,7 @@ def build_strategy(
 ) -> Dict[str, Any]:
     segment = profile.get("segment", "new")
     mode = analysis.get("category", "sales")
+    vendor_domain = analysis.get("vendor_domain", "")
     support_open = bool(state.get("open_ticket_id"))
     cart_size = len((state.get("cart") or {}).get("items", []))
     service_level = "premium" if segment == "vip" else "standard"
@@ -284,6 +290,7 @@ def build_strategy(
         "support_recovery_priority": 0.88 if support_open or mode == "support" else 0.2,
         "business_context_priority": 0.55 if mode in {"sales", "support"} else 0.3,
         "memory_priority": 0.66 if analysis.get("complexity") in {"high", "multi_step"} or support_open else 0.3,
+        "vendor_domain": vendor_domain,
     }
 
     if mode == "support":
@@ -330,13 +337,9 @@ def cheap_action_allowed(analysis: Dict[str, Any], user: Dict[str, Any], state: 
         return False
     if analysis.get("intent") == "general" and analysis.get("confidence", 0.0) >= 0.52 and analysis.get("uncertainty", 1.0) <= 0.42 and analysis.get("prototype_score", 0.0) >= 0.18 and not state.get("workflow", {}).get("name"):
         return True
-    if analysis.get("intent") == "browse" and analysis.get("confidence", 0.0) >= 0.58 and analysis.get("uncertainty", 1.0) <= 0.36 and (analysis.get("browse_strength", 0) >= 2 or analysis.get("prototype_score", 0.0) >= 0.45) and not state.get("workflow", {}).get("name"):
-        return True
-    if user.get("role") == "vendor" and analysis.get("vendor_status_options") and analysis["vendor_status_options"][0]["score"] >= 1.4:
-        return True
-    if state.get("workflow", {}).get("stage") == "collect_address" and analysis.get("intent") == "checkout" and analysis.get("probable_address") and not analysis.get("is_correction"):
-        return True
     if state.get("workflow", {}).get("stage") == "ready_to_checkout" and analysis.get("intent") == "checkout" and analysis.get("confidence", 0.0) >= 0.75:
+        return True
+    if analysis.get("cart_view_request"):
         return True
     return False
 
@@ -382,6 +385,18 @@ def _category_for_intent(intent: str) -> str:
     if intent in {"order_status", "checkout", "cart"}:
         return "order"
     return "sales"
+
+
+def _vendor_domain(tokens: List[str], lowered: str, user: Dict[str, Any]) -> str:
+    if user.get("role") != "vendor":
+        return ""
+    token_set = set(tokens)
+    financial_score = len(token_set & VENDOR_FINANCIAL_MARKERS) + int(any(marker in lowered for marker in {"top products", "sales summary", "business health"}))
+    fulfillment_score = len(token_set & VENDOR_FULFILLMENT_MARKERS)
+    operational_score = len(token_set & VENDOR_OPERATIONAL_MARKERS)
+    scores = {"financial": financial_score, "fulfillment": fulfillment_score, "operational": operational_score}
+    winner = max(scores.items(), key=lambda item: item[1])
+    return winner[0] if winner[1] > 0 else "operational"
 
 
 def _is_correction(lowered: str) -> bool:

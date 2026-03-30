@@ -8,7 +8,32 @@ def validate_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "Missing action"
     if action == "respond":
         return True, ""
-    if action in {"inspect_customer_context", "inspect_order_context", "inspect_support_context", "inspect_business_context", "inspect_memory_context", "repair_order_context", "checkout_order", "search_catalog", "get_product_details", "get_order_status", "create_support_ticket", "resolve_support_ticket", "recommend_products", "manage_product", "update_business_profile", "create_offer", "create_promotion", "create_event", "send_broadcast", "summarize_business", "list_orders"}:
+    if action in {
+        "inspect_customer_context",
+        "inspect_order_context",
+        "inspect_support_context",
+        "inspect_business_context",
+        "inspect_memory_context",
+        "repair_order_context",
+        "checkout_order",
+        "search_catalog",
+        "get_product_details",
+        "get_order_status",
+        "create_support_ticket",
+        "resolve_support_ticket",
+        "recommend_products",
+        "manage_product",
+        "update_business_profile",
+        "create_offer",
+        "create_promotion",
+        "create_event",
+        "send_broadcast",
+        "summarize_business",
+        "summarize_sales",
+        "get_top_products",
+        "get_business_health_metrics",
+        "list_orders",
+    }:
         return True, ""
     if action == "filter_orders":
         return isinstance(args.get("status", ""), str), "filter_orders.status must be a string"
@@ -29,9 +54,15 @@ def validate_action(action: str, args: Dict[str, Any]) -> Tuple[bool, str]:
         if "address" in args and not isinstance(args.get("address"), str):
             return False, "collect_address.address must be a string"
         return True, ""
-    if action == "vendor_update_order_status":
+    if action in {"vendor_update_order_status", "update_order_status"}:
         status = str(args.get("status") or "").strip().lower()
         if status not in {"accepted", "rejected", "out_for_delivery", "delivered"}:
             return False, "Unsupported vendor status"
+        return True, ""
+    if action == "bulk_update_orders":
+        if not isinstance(args.get("criteria") or {}, dict):
+            return False, "bulk_update_orders.criteria must be an object"
+        if not isinstance(args.get("action") or {}, dict):
+            return False, "bulk_update_orders.action must be an object"
         return True, ""
     return False, f"Unknown action: {action}"

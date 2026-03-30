@@ -41,6 +41,7 @@ router = APIRouter(prefix="/api", tags=["dashboard-api"])
 
 
 class BusinessPayload(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str = ""
     slug: str = ""
     whatsapp_number: str = ""
@@ -56,9 +57,13 @@ class BusinessPayload(BaseModel):
     active: Optional[bool] = None
     plan: str = "basic"
     subscription_status: str = "trialing"
+    messaging_rate_limit_per_minute: Optional[int] = None
+    automation_cooldown_minutes: Optional[int] = None
+    automation_max_messages_per_day: Optional[int] = None
 
 
 class ProductPayload(BaseModel):
+    model_config = {"extra": "forbid"}
     name: str = ""
     price: Optional[float] = None
     unit: str = "unit"
@@ -70,6 +75,7 @@ class ProductPayload(BaseModel):
 
 
 class SettingsPayload(BaseModel):
+    model_config = {"extra": "forbid"}
     name: Optional[str] = None
     business_type: Optional[str] = None
     description: Optional[str] = None
@@ -80,9 +86,13 @@ class SettingsPayload(BaseModel):
     policies: Optional[str] = None
     delivery_info: Optional[str] = None
     broadcast_groups: Optional[list[str]] = None
+    messaging_rate_limit_per_minute: Optional[int] = None
+    automation_cooldown_minutes: Optional[int] = None
+    automation_max_messages_per_day: Optional[int] = None
 
 
 class OnboardingStepPayload(BaseModel):
+    model_config = {"extra": "forbid"}
     step: str
     mark_complete: bool = False
 

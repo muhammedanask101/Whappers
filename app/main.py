@@ -13,7 +13,6 @@ from app.api.contracts import error_response, should_wrap_api_response
 from app.core.settings import get_settings
 from app.db.database import init_db
 from app.db.mongo import get_mongo_database
-from app.routes.admin_api import router as admin_api_router
 from app.routes.api_auth import router as api_auth_router
 from app.routes.api_dashboard import router as api_dashboard_router
 from app.routes.api_subscription import router as api_subscription_router
@@ -76,7 +75,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.include_router(onboarding_router)
 app.include_router(whatsapp_router)
-app.include_router(admin_api_router)
 app.include_router(api_auth_router)
 app.include_router(api_dashboard_router)
 app.include_router(api_subscription_router)

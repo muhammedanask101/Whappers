@@ -9,7 +9,6 @@ from app.api.contracts import success_response
 from app.services.auth import (
     ROLE_BUSINESS_ADMIN,
     authenticate_credentials,
-    authenticate_legacy_admin_token,
     create_user,
     get_current_api_user,
     issue_auth_tokens,
@@ -24,12 +23,13 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class LoginRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     email: Optional[str] = None
     password: str = ""
-    admin_token: str = ""
 
 
 class SignupRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     owner_name: str = Field(min_length=1)
     email: str = Field(min_length=3)
     password: str = Field(min_length=8)
@@ -45,9 +45,6 @@ def login(payload: LoginRequest, response: Response) -> dict:
     user = None
     if payload.email and payload.password:
         user = authenticate_credentials(payload.email, payload.password)
-    elif payload.admin_token:
-        print("[route.api_auth] deprecated_admin_token_login_used")
-        user = authenticate_legacy_admin_token(payload.admin_token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials.")
     return success_response(issue_auth_tokens(response, user))

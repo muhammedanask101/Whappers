@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import timedelta
 from typing import Any, Dict, List
 
-from app.db.mongo import get_collection
+from app.db.mongo import get_collection, utc_now
 from app.services.intelligence.customer_profile import get_segment_snapshot
 
 
@@ -11,11 +12,32 @@ def get_business_metrics(business_id: str) -> Dict[str, Any]:
     orders = list(get_collection("orders").find({"business_id": business_id}))
     customers = list(get_collection("customer_profiles").find({"business_id": business_id}))
     tickets = list(get_collection("support_tickets").find({"business_id": business_id}))
+    runs = list(get_collection("automation_runs").find({"business_id": business_id}).sort("created_at", -1).limit(200))
+    leads = max(
+        len({str(row.get("customer_phone") or "") for row in orders if row.get("customer_phone")}),
+        get_collection("conversation_state").count_documents({"business_id": business_id, "role": "customer"}),
+        1,
+    )
 
     total_orders = len(orders)
     total_revenue = sum(float(order.get("total", 0.0)) for order in orders)
     avg_order_value = total_revenue / total_orders if total_orders else 0.0
     open_tickets = sum(1 for ticket in tickets if ticket.get("status") != "resolved")
+    repeat_customers = _repeat_customer_rate(orders)
+    cart_abandonment_rate = _cart_abandonment_rate(business_id, orders)
+    automation_success_rate = _automation_success_rate(runs)
+    revenue_per_customer = total_revenue / max(len(customers), 1) if customers else 0.0
+    conversion_rate = total_orders / max(leads, 1)
+
+    performance = {
+        "conversion_rate": round(conversion_rate, 4),
+        "cart_abandonment_rate": round(cart_abandonment_rate, 4),
+        "avg_order_value": round(avg_order_value, 2),
+        "repeat_customer_rate": round(repeat_customers, 4),
+        "revenue_per_customer": round(revenue_per_customer, 2),
+        "automation_success_rate": round(automation_success_rate, 4),
+    }
+    _store_performance_snapshot(business_id, performance)
 
     return {
         "total_orders": total_orders,
@@ -24,12 +46,15 @@ def get_business_metrics(business_id: str) -> Dict[str, Any]:
         "total_customers": len(customers),
         "open_tickets": open_tickets,
         "segment_snapshot": get_segment_snapshot(business_id),
-        "performance": _performance_metrics(business_id),
+        "performance": performance | _performance_metrics(business_id),
     }
 
 
-def get_top_products(business_id: str) -> List[Dict[str, Any]]:
-    orders = list(get_collection("orders").find({"business_id": business_id}))
+def get_top_products(business_id: str, *, time_window_days: int | None = None) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"business_id": business_id}
+    if time_window_days is not None:
+        query["created_at"] = {"$gte": utc_now() - timedelta(days=max(1, time_window_days))}
+    orders = list(get_collection("orders").find(query))
     counter = Counter()
     revenue = Counter()
 
@@ -59,8 +84,11 @@ def get_top_products(business_id: str) -> List[Dict[str, Any]]:
 def _performance_metrics(business_id: str) -> Dict[str, Any]:
     rows = list(get_collection("performance_metrics").find({"business_id": business_id}).sort("created_at", -1).limit(1000))
     aggregated = Counter()
+    latest: Dict[str, float] = {}
     for row in rows:
-        aggregated[str(row.get("metric") or "")] += float(row.get("amount", 0.0))
+        metric_name = str(row.get("metric") or "")
+        aggregated[metric_name] += float(row.get("amount", 0.0))
+        latest.setdefault(metric_name, float(row.get("amount", 0.0)))
     agent_runs = max(float(aggregated.get("agent_runs", 0.0)), 1.0)
     return {
         "agent_runs": int(aggregated.get("agent_runs", 0.0)),
@@ -68,4 +96,61 @@ def _performance_metrics(business_id: str) -> Dict[str, Any]:
         "order_completion_rate": round(float(aggregated.get("order_completion", 0.0)) / agent_runs, 4),
         "support_handled": int(aggregated.get("support_handled", 0.0)),
         "avg_uncertainty": round(float(aggregated.get("agent_uncertainty", 0.0)) / agent_runs, 4),
+        "latest": {key: round(value, 4) for key, value in latest.items() if key in {"conversion_rate", "cart_abandonment_rate", "avg_order_value", "repeat_customer_rate", "revenue_per_customer", "automation_success_rate"}},
     }
+
+
+def _repeat_customer_rate(orders: List[Dict[str, Any]]) -> float:
+    counts = Counter(str(order.get("customer_phone") or "") for order in orders if order.get("customer_phone"))
+    if not counts:
+        return 0.0
+    repeat = sum(1 for _, count in counts.items() if count > 1)
+    return repeat / max(len(counts), 1)
+
+
+def _cart_abandonment_rate(business_id: str, orders: List[Dict[str, Any]]) -> float:
+    order_phones = {str(order.get("customer_phone") or "") for order in orders if order.get("customer_phone")}
+    active_carts = get_collection("conversation_state").count_documents(
+        {
+            "business_id": business_id,
+            "role": "customer",
+            "cart.items.0": {"$exists": True},
+            "workflow.name": {"$ne": "order_checkout_complete"},
+        }
+    )
+    if active_carts == 0:
+        return 0.0
+    carts_with_orders = sum(1 for phone in get_collection("conversation_state").distinct("phone", {"business_id": business_id, "cart.items.0": {"$exists": True}}) if phone in order_phones)
+    abandoned = max(active_carts - carts_with_orders, 0)
+    return abandoned / max(active_carts, 1)
+
+
+def _automation_success_rate(runs: List[Dict[str, Any]]) -> float:
+    if not runs:
+        return 0.0
+    successes = sum(1 for row in runs if row.get("converted"))
+    return successes / max(len(runs), 1)
+
+
+def _store_performance_snapshot(business_id: str, metrics: Dict[str, float]) -> None:
+    cutoff = utc_now() - timedelta(minutes=15)
+    existing = get_collection("performance_metrics").find_one(
+        {
+            "business_id": business_id,
+            "metric": "conversion_rate",
+            "created_at": {"$gte": cutoff},
+        }
+    )
+    if existing:
+        return
+    now = utc_now()
+    for metric, amount in metrics.items():
+        get_collection("performance_metrics").insert_one(
+            {
+                "business_id": business_id,
+                "metric": metric,
+                "amount": float(amount),
+                "dimensions": {"kind": "snapshot"},
+                "created_at": now,
+            }
+        )
