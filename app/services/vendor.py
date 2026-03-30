@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import os
 import re
@@ -10,9 +11,11 @@ from typing import Any, Dict, List, Optional
 
 from pymongo import ReturnDocument
 
+from app.core.settings import get_settings
 from app.db.mongo import DEFAULT_BUSINESS_ID, generate_id, get_collection, parse_datetime, slugify, to_iso, utc_now
 from app.services.agent.localization import contact_style, status_phrase, style_text
 from app.models.order import OrderRecord
+from app.services.resilience import ResilientClientError, get_resilient_caller
 
 
 def _log_vendor(event: str, **details: Any) -> None:
@@ -36,22 +39,40 @@ def normalize_phone(phone: str) -> str:
     return f"whatsapp:{digits}"
 
 
-def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None) -> Dict[str, Any]:
+def send_whatsapp_message(
+    to: str,
+    body: str,
+    from_number: Optional[str] = None,
+    *,
+    business_id: str = DEFAULT_BUSINESS_ID,
+    notification_type: str = "message",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    settings = get_settings()
     normalized_to = normalize_phone(to)
-    normalized_from = normalize_phone(from_number or os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip())
-    _log_vendor("send_whatsapp_message_start", to=normalized_to, from_number=normalized_from, body_preview=body[:240], debug_mode=os.getenv("DEBUG", "").strip().lower() == "true")
-    if os.getenv("DEBUG", "").strip().lower() == "true":
+    normalized_from = normalize_phone(from_number or settings.twilio_whatsapp_number)
+    _log_vendor("send_whatsapp_message_start", to=normalized_to, from_number=normalized_from, body_preview=body[:240], debug_mode=settings.debug_mode)
+    if settings.debug_mode:
         print("=== DEBUG WHATSAPP MESSAGE ===")
         print(f"FROM: {normalized_from}")
         print(f"TO: {normalized_to}")
         print(body)
         print("==============================")
-        return {"ok": True, "debug": True}
+        return {"success": True, "debug": True, "provider": "debug"}
 
-    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    account_sid = settings.twilio_account_sid
+    auth_token = settings.twilio_auth_token
     if not all([account_sid, auth_token, normalized_from]):
-        raise RuntimeError("Twilio WhatsApp environment variables are not fully configured.")
+        error = "Twilio WhatsApp environment variables are not fully configured."
+        queue_vendor_dispatch(
+            business_id=business_id,
+            target_phone=normalized_to,
+            payload={"body": body, "from_number": normalized_from},
+            notification_type=notification_type,
+            error=error,
+            metadata=metadata,
+        )
+        return {"success": False, "error": error, "queued": True}
 
     payload = urllib.parse.urlencode({"From": normalized_from, "To": normalized_to, "Body": body}).encode("utf-8")
     credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
@@ -61,30 +82,53 @@ def send_whatsapp_message(to: str, body: str, from_number: Optional[str] = None)
         headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    last_error: Exception | None = None
-    for attempt in range(2):
+    def _request() -> Dict[str, Any]:
         try:
-            _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body), attempt=attempt + 1)
+            _log_vendor("external_api_request", provider="twilio", to=normalized_to, from_number=normalized_from, body_chars=len(body))
             with urllib.request.urlopen(request, timeout=30) as response:
                 data = json.loads(response.read().decode("utf-8"))
                 _log_vendor("external_api_response", provider="twilio", sid=data.get("sid"), status=data.get("status"), to=normalized_to)
-                return data
+                return {"success": True, "provider": "twilio", **data}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}", attempt=attempt + 1)
-            last_error = RuntimeError(f"Twilio message send failed: {exc.code} {detail}")
-            if exc.code == 429 and attempt == 0:
-                time.sleep(0.2)
-                continue
-            raise last_error from exc
+            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=f"{exc.code} {detail[:240]}")
+            raise RuntimeError(f"Twilio message send failed: {exc.code} {detail}") from exc
         except urllib.error.URLError as exc:
-            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason), attempt=attempt + 1)
-            last_error = RuntimeError(f"Twilio message send failed: {exc.reason}")
-            if attempt == 0:
-                time.sleep(0.2)
-                continue
-            raise last_error from exc
-    raise last_error or RuntimeError("Twilio message send failed.")
+            _log_vendor("external_api_error", provider="twilio", to=normalized_to, error=str(exc.reason))
+            raise RuntimeError(f"Twilio message send failed: {exc.reason}") from exc
+
+    try:
+        return get_resilient_caller("twilio-send", max_retries=2).call(_request)
+    except (ResilientClientError, RuntimeError) as exc:
+        queue_vendor_dispatch(
+            business_id=business_id,
+            target_phone=normalized_to,
+            payload={"body": body, "from_number": normalized_from},
+            notification_type=notification_type,
+            error=str(exc),
+            metadata=metadata,
+        )
+        return {"success": False, "error": str(exc), "queued": True}
+
+
+async def send_whatsapp_message_async(
+    to: str,
+    body: str,
+    from_number: Optional[str] = None,
+    *,
+    business_id: str = DEFAULT_BUSINESS_ID,
+    notification_type: str = "message",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        send_whatsapp_message,
+        to,
+        body,
+        from_number,
+        business_id=business_id,
+        notification_type=notification_type,
+        metadata=metadata,
+    )
 
 
 def normalize_product_name(name: str) -> str:
@@ -476,6 +520,47 @@ def get_business_profile(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, An
     }
 
 
+def list_orders(business_id: str = DEFAULT_BUSINESS_ID, *, limit: int = 20) -> List[Dict[str, Any]]:
+    rows = get_collection("orders").find({"business_id": business_id}).sort("created_at", -1).limit(min(max(int(limit or 20), 1), 100))
+    return [
+        {
+            "order_id": row.get("order_id"),
+            "customer_phone": row.get("customer_phone"),
+            "status": row.get("status"),
+            "total": float(row.get("total", 0.0)),
+            "created_at": to_iso(parse_datetime(row.get("created_at"))),
+        }
+        for row in rows
+    ]
+
+
+def filter_orders(business_id: str = DEFAULT_BUSINESS_ID, *, status: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"business_id": business_id}
+    if status:
+        query["status"] = status
+    rows = get_collection("orders").find(query).sort("created_at", -1).limit(min(max(int(limit or 20), 1), 100))
+    return [
+        {
+            "order_id": row.get("order_id"),
+            "customer_phone": row.get("customer_phone"),
+            "status": row.get("status"),
+            "total": float(row.get("total", 0.0)),
+            "created_at": to_iso(parse_datetime(row.get("created_at"))),
+        }
+        for row in rows
+    ]
+
+
+def summarize_business(business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, Any]:
+    return {
+        "business": get_business_profile(business_id),
+        "order_count": get_collection("orders").count_documents({"business_id": business_id}),
+        "pending_orders": get_collection("orders").count_documents({"business_id": business_id, "status": "pending"}),
+        "product_count": get_collection("products").count_documents({"business_id": business_id, "active": True}),
+        "support_open": get_collection("support_tickets").count_documents({"business_id": business_id, "status": {"$ne": "resolved"}}),
+    }
+
+
 def update_business_profile(
     *,
     business_id: str = DEFAULT_BUSINESS_ID,
@@ -673,17 +758,29 @@ def send_vendor_order_notification(order: OrderRecord, business_id: str = DEFAUL
     vendor_phone = _vendor_contact_phone(business_id)
     if not vendor_phone:
         raise RuntimeError("Vendor phone is not configured for this business.")
-
     try:
-        send_whatsapp_message(vendor_phone, build_vendor_order_message(order, style=contact_style(vendor_phone, business_id)), from_number=get_business_profile(business_id).get("whatsapp_number"))
-        return True
+        message_style = contact_style(vendor_phone, business_id)
+    except Exception:
+        message_style = "english"
+    try:
+        result = send_whatsapp_message(
+            vendor_phone,
+            build_vendor_order_message(order, style=message_style),
+            from_number=get_business_profile(business_id).get("whatsapp_number"),
+            business_id=business_id,
+            notification_type="vendor_order_notification",
+            metadata={"order_id": order.orderId},
+        )
     except Exception as exc:
-        print("Vendor notification failed:", str(exc))
-        print("=== VENDOR ORDER ===")
-        print(order.model_dump_json(indent=2))
-        print("====================")
-        queue_vendor_notification(order, business_id=business_id, error=str(exc))
-        return False
+        result = {"success": False, "error": str(exc)}
+    if result.get("success"):
+        return True
+    print("Vendor notification failed:", str(result.get("error") or "unknown"))
+    print("=== VENDOR ORDER ===")
+    print(order.model_dump_json(indent=2))
+    print("====================")
+    queue_vendor_notification(order, business_id=business_id, error=str(result.get("error") or "send failed"))
+    return False
 
 
 def build_vendor_order_message(order: OrderRecord, style: str = "english") -> str:
@@ -731,18 +828,68 @@ def queue_vendor_notification(order: OrderRecord, business_id: str = DEFAULT_BUS
     )
 
 
+def queue_vendor_dispatch(
+    *,
+    business_id: str,
+    target_phone: str,
+    payload: Dict[str, Any],
+    notification_type: str,
+    error: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    queue_key = {
+        "business_id": business_id,
+        "target_phone": target_phone,
+        "notification_type": notification_type,
+        "payload_hash": str(hash(json.dumps(payload, sort_keys=True, default=str))),
+    }
+    get_collection("vendor_notification_queue").update_one(
+        queue_key,
+        {
+            "$set": {
+                **queue_key,
+                "payload_json": payload,
+                "metadata": metadata or {},
+                "status": "pending",
+                "last_error": error or None,
+                "updated_at": utc_now(),
+            },
+            "$setOnInsert": {"attempts": 0, "created_at": utc_now()},
+        },
+        upsert=True,
+    )
+
+
 def retry_failed_notifications(business_id: str = DEFAULT_BUSINESS_ID) -> int:
     sent = 0
-    vendor_phone = _vendor_contact_phone(business_id)
-    if not vendor_phone:
-        return sent
-
     queue = get_collection("vendor_notification_queue")
-    from_number = get_business_profile(business_id).get("whatsapp_number")
     for row in queue.find({"business_id": business_id, "status": "pending"}).sort("created_at", 1):
-        order = OrderRecord.model_validate(row["payload_json"])
         try:
-            send_whatsapp_message(vendor_phone, build_vendor_order_message(order, style=contact_style(vendor_phone, business_id)), from_number=from_number)
+            if row.get("order_id"):
+                vendor_phone = _vendor_contact_phone(business_id)
+                if not vendor_phone:
+                    continue
+                from_number = get_business_profile(business_id).get("whatsapp_number")
+                order = OrderRecord.model_validate(row["payload_json"])
+                result = send_whatsapp_message(
+                    vendor_phone,
+                    build_vendor_order_message(order, style=contact_style(vendor_phone, business_id)),
+                    from_number=from_number,
+                    business_id=business_id,
+                    notification_type="vendor_order_notification",
+                    metadata={"order_id": order.orderId},
+                )
+            else:
+                result = send_whatsapp_message(
+                    str(row.get("target_phone") or ""),
+                    str((row.get("payload_json") or {}).get("body") or ""),
+                    from_number=str((row.get("payload_json") or {}).get("from_number") or ""),
+                    business_id=business_id,
+                    notification_type=str(row.get("notification_type") or "message"),
+                    metadata=dict(row.get("metadata") or {}),
+                )
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("error") or "vendor send failed"))
             queue.update_one({"_id": row["_id"]}, {"$set": {"status": "sent", "updated_at": utc_now()}, "$inc": {"attempts": 1}})
             sent += 1
         except Exception as exc:
@@ -778,7 +925,7 @@ def notify_customer_order_update(customer_phone: str, order: OrderRecord, style_
         message = f"Ningalude order {order.orderId} ippo {order.status.replace('_', ' ')} aanu."
     else:
         message = f"Your order {order.orderId} is now {order.status.replace('_', ' ')}."
-    send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+    send_whatsapp_message(customer_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"), business_id=business_id, notification_type="customer_order_update", metadata={"order_id": order.orderId})
 
 
 def generate_vendor_acknowledgement(order: OrderRecord, style: str, status: str) -> str:
@@ -1028,7 +1175,7 @@ def _notify_vendor_support_ticket_legacy_removed(ticket: Dict[str, Any], busines
         f"Order ID: {ticket.get('order_id') or 'N/A'}",
     )
     try:
-        send_whatsapp_message(vendor_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"))
+        send_whatsapp_message(vendor_phone, message, from_number=get_business_profile(business_id).get("whatsapp_number"), business_id=business_id, notification_type="support_ticket_notification", metadata={"ticket_id": ticket.get("ticket_id")})
     except Exception as exc:
         print("Support ticket notification failed:", str(exc))
         print(message)

@@ -1,14 +1,53 @@
-* { box-sizing: border-box; }
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
-  font-family: system-ui, sans-serif;
-  background: #f6f4ef;
-  color: #1d2328;
+  min-height: 100vh;
+  font-family: Manrope, "Segoe UI", sans-serif;
+  color: #15202b;
+  background: #f4eee6;
 }
-input, textarea, button, select {
-  font: inherit;
-}
+
 a {
   color: inherit;
   text-decoration: none;
+}
+
+input,
+textarea,
+button,
+select {
+  font: inherit;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  border-radius: 18px;
+  border: 1px solid rgba(21, 32, 43, 0.12);
+  background: rgba(255, 255, 255, 0.88);
+  padding: 0.85rem 1rem;
+  outline: none;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: rgba(175, 77, 31, 0.65);
+  box-shadow: 0 0 0 4px rgba(175, 77, 31, 0.12);
+}
+
+button {
+  cursor: pointer;
 }

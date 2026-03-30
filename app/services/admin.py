@@ -1,8 +1,11 @@
-import hashlib
+from __future__ import annotations
+
 import hmac
 import os
 import secrets
 from typing import Any, Dict, List, Optional
+
+import bcrypt
 
 from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 from app.services.vendor import create_business, get_business_by_id, list_businesses, update_business
@@ -13,20 +16,29 @@ def ensure_manager_seed() -> None:
     password = os.getenv("MANAGER_PASSWORD", "").strip()
     if not email or not password:
         return
+    existing = get_collection("manager_users").find_one({"email": email})
+    if existing and str(existing.get("password_hash") or "").startswith("$2"):
+        return
     now = utc_now()
+    password_hash, password_salt = hash_password(password)
     get_collection("manager_users").update_one(
         {"email": email},
         {
-            "$set": {"password_hash": hash_password(password), "updated_at": now, "active": True},
+            "$set": {
+                "password_hash": password_hash,
+                "password_salt": password_salt,
+                "updated_at": now,
+                "active": True,
+            },
             "$setOnInsert": {"created_at": now},
         },
         upsert=True,
     )
 
 
-def hash_password(password: str) -> str:
-    salt = os.getenv("MANAGER_PASSWORD_SALT", "whatsapp-agent-manager").encode("utf-8")
-    return hashlib.sha256(salt + password.encode("utf-8")).hexdigest()
+def hash_password(password: str) -> tuple[str, str]:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8"), salt.decode("utf-8")
 
 
 def authenticate_manager(email: str, password: str) -> Optional[Dict[str, Any]]:
@@ -34,8 +46,10 @@ def authenticate_manager(email: str, password: str) -> Optional[Dict[str, Any]]:
     document = get_collection("manager_users").find_one({"email": email.strip().lower(), "active": True})
     if not document:
         return None
-    expected = str(document.get("password_hash") or "")
-    if not hmac.compare_digest(expected, hash_password(password)):
+    stored_hash = str(document.get("password_hash") or "")
+    if not stored_hash.startswith("$2"):
+        return None
+    if not bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8")):
         return None
     return {"email": document["email"]}
 
@@ -68,9 +82,7 @@ def get_business_snapshot(business_id: str) -> Optional[Dict[str, Any]]:
     business = get_business_by_id(business_id)
     if not business:
         return None
-    business["recent_orders"] = list(
-        get_collection("orders").find({"business_id": business_id}).sort("created_at", -1).limit(10)
-    )
+    business["recent_orders"] = list(get_collection("orders").find({"business_id": business_id}).sort("created_at", -1).limit(10))
     return business
 
 
@@ -132,3 +144,16 @@ def get_selected_business_id(requested: Optional[str]) -> str:
 
 def new_session_token() -> str:
     return secrets.token_urlsafe(24)
+
+
+def ensure_csrf_token(session: Dict[str, Any]) -> str:
+    token = str(session.get("csrf_token") or "")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def validate_csrf_token(session: Dict[str, Any], token: str) -> bool:
+    expected = str(session.get("csrf_token") or "")
+    return bool(expected and token) and hmac.compare_digest(expected, str(token))

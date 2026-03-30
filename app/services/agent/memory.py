@@ -48,6 +48,26 @@ DEFAULT_STATE = {
     "last_tool_gap": {},
     "tool_failures": {},
     "memory_version": 3,
+    "runtime_state": {
+        "workflow": {
+            "name": "",
+            "stage": "",
+            "required_slots": [],
+            "filled_slots": {},
+            "next_question": "",
+        },
+        "cart": {"items": [], "address": "", "updated_at": None},
+        "goal": {
+            "goal_type": "",
+            "goal_text": "",
+            "status": "idle",
+            "current_plan": [],
+            "completed_steps": [],
+            "progress_score": 0.0,
+            "last_updated_at": None,
+        },
+        "pending_actions": [],
+    },
 }
 
 
@@ -67,6 +87,12 @@ def get_state(phone: str, business_id: str = DEFAULT_BUSINESS_ID) -> Dict[str, A
         state["intent_history"] = []
     if not isinstance(state.get("goal_tracking"), dict):
         state["goal_tracking"] = dict(DEFAULT_STATE["goal_tracking"])
+    state["runtime_state"] = {
+        "workflow": dict(state.get("workflow") or {}),
+        "cart": dict(state.get("cart") or {}),
+        "goal": dict(state.get("goal_tracking") or {}),
+        "pending_actions": list(state.get("runtime_state", {}).get("pending_actions") or []),
+    }
     return state
 
 
@@ -143,6 +169,12 @@ def update_language(user: Dict[str, Any], message: str, business_id: str) -> str
 
 
 def persist_state(phone: str, business_id: str, state: Dict[str, Any], role: str) -> None:
+    runtime_state = {
+        "workflow": dict(state.get("workflow") or {}),
+        "cart": dict(state.get("cart") or {}),
+        "goal": dict(state.get("goal_tracking") or {}),
+        "pending_actions": list((state.get("runtime_state") or {}).get("pending_actions") or []),
+    }
     sanitized = {
         "business_id": business_id,
         "phone": phone,
@@ -164,6 +196,7 @@ def persist_state(phone: str, business_id: str, state: Dict[str, Any], role: str
         "last_reflection": state.get("last_reflection", {}),
         "last_tool_gap": state.get("last_tool_gap", {}),
         "tool_failures": state.get("tool_failures", {}),
+        "runtime_state": runtime_state,
         "memory_version": 3,
         "updated_at": utc_now(),
     }

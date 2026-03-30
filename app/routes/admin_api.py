@@ -146,7 +146,8 @@ def admin_support(
     ]
 
 @router.get("/dashboard/{business_id}")
-def get_dashboard(business_id: str):
+def get_dashboard(business_id: str, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin_token(x_admin_token)
     metrics = get_business_metrics(business_id)
     top_products = get_top_products(business_id)
     insights = generate_insights(business_id)

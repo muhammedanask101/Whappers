@@ -17,7 +17,7 @@ def _log_main_agent(event: str, **details: Any) -> None:
     print(f"[agent.main] {event} {normalized}".rstrip())
 
 
-MAX_STEPS = 3
+MAX_STEPS = 4
 INTERNAL_TOOLS = {
     "inspect_customer_context",
     "inspect_order_context",
@@ -52,7 +52,9 @@ async def run_agent(
     working_state["last_tool_used"] = str(state.get("last_tool_used") or "")
     working_state["same_tool_counter"] = int(state.get("same_tool_counter") or 0)
     working_state["force_deterministic_fallback"] = False
+    working_state["executed_tool_signatures"] = list(state.get("executed_tool_signatures") or [])
     working_state["goal_tracking"] = update_goal_tracking(working_state, intent=analysis["intent"], user_message=user_message)
+    seen_signatures = set(str(item) for item in working_state["executed_tool_signatures"])
 
     if _should_clarify_before_execution(analysis):
         final_reply = _clarification_message(analysis["intent"], style)
@@ -112,6 +114,14 @@ async def run_agent(
             _relax_workflow_if_stuck(working_state, decision.action, analysis, user_message)
             continue
 
+        decision_signature = f"{decision.action}:{repr(sorted(decision.arguments.items()))}"
+        if decision_signature in seen_signatures:
+            final_reply = _converged_fallback_message(decision.action, analysis["intent"], style)
+            working_state["force_deterministic_fallback"] = True
+            break
+        seen_signatures.add(decision_signature)
+        working_state["executed_tool_signatures"] = list(seen_signatures)[-12:]
+
         _log_main_agent("tool_execute_start", step=step + 1, action=decision.action)
         before_state = _progress_snapshot(working_state)
         observation = execute_tool(
@@ -148,6 +158,10 @@ async def run_agent(
             analysis["needs_llm"] = True
             analysis["uncertainty"] = min(1.0, analysis.get("uncertainty", 0.0) + 0.22)
             _relax_workflow_if_stuck(working_state, observation.tool, analysis, user_message)
+            if int((working_state.get("tool_failures") or {}).get(observation.tool, 0)) >= 2:
+                final_reply = _converged_fallback_message(observation.tool, analysis["intent"], style)
+                working_state["force_deterministic_fallback"] = True
+                break
             if step == MAX_STEPS - 1:
                 final_reply = observation.error or _fallback_message(analysis["intent"], strategy, style)
             continue
@@ -157,7 +171,8 @@ async def run_agent(
             _record_tool_failure(working_state, observation.tool)
             working_state["last_tool_gap"] = {"tool": observation.tool, "reason": "no_progress", "query": decision.arguments.get("query") or decision.arguments.get("raw_message") or user_message}
             working_state["force_deterministic_fallback"] = True
-            continue
+            final_reply = _converged_fallback_message(observation.tool, analysis["intent"], style)
+            break
         useful = is_useful_tool_observation(observation)
         if not useful:
             _log_main_agent("tool_not_useful", step=step + 1, tool=observation.tool, message_preview=observation.message[:160])
@@ -174,7 +189,7 @@ async def run_agent(
 
         if int(working_state.get("same_tool_counter", 0)) >= 2:
             working_state["force_deterministic_fallback"] = True
-            final_reply = observation.message or _clarification_message(analysis["intent"], style)
+            final_reply = _converged_fallback_message(observation.tool, analysis["intent"], style)
             break
 
         if _should_replan_after_observation(decision, observation, analysis) and step < MAX_STEPS - 1:
@@ -354,6 +369,16 @@ def _clarification_message(intent: str, style: str) -> str:
     if intent == "support":
         return style_text(style, "Please describe the issue, what went wrong, and any related order ID.", "Issue enthaanu, enthaanu wrong ayathu, order ID undenkil athum parayu.", "പ്രശ്നം എന്താണ്, എന്താണ് തെറ്റായത്, ബന്ധപ്പെട്ട ഓർഡർ ഐഡി ഉണ്ടെങ്കിൽ അതും പറയൂ.")
     return contact_reply_prompt(style)
+
+
+def _converged_fallback_message(tool: str, intent: str, style: str) -> str:
+    if tool == "manage_cart":
+        return style_text(style, "I need the exact product name, quantity, and operation like add, remove, or set.", "Exact product name, quantity, add/remove/set ennu parayu.", "Exact product name, quantity, add/remove/set ennu parayu.")
+    if tool == "collect_address":
+        return style_text(style, "Please send the full address as: house or building, area, landmark if any, and 6-digit PIN.", "Full address house/building, area, landmark undenkil athum, 6-digit PIN format-il ayakku.", "Full address house/building, area, landmark undenkil athum, 6-digit PIN format-il ayakku.")
+    return _clarification_message(intent, style)
+
+
 def _should_replan_after_observation(decision: PlannerDecision, observation: ToolObservation, analysis: Dict[str, Any]) -> bool:
     if not is_useful_tool_observation(observation):
         return True

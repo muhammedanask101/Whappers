@@ -7,3 +7,4 @@ itsdangerous
 slowapi
 python-dotenv
 twilio
+bcrypt

@@ -11,6 +11,7 @@ def create_broadcast_preview(message: str, targets: List[str]) -> Dict[str, str]
 def execute_broadcast(message: str, targets: List[str], from_number: str = "") -> Dict[str, int]:
     sent = 0
     for target in targets:
-        send_whatsapp_message(target, message, from_number=from_number or None)
-        sent += 1
+        result = send_whatsapp_message(target, message, from_number=from_number or None)
+        if result.get("success"):
+            sent += 1
     return {"sent": sent}

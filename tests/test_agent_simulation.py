@@ -824,7 +824,7 @@ class AgentSimulationTests(unittest.TestCase):
         import app.services.agent.tools as tools_mod
 
         observation = tools_mod._tool_collect_address(
-            {"address": "K.T House, Iriya P.O"},
+            {"address": "K.T House, Iriya P.O, Near Temple, 671531"},
             {"cart": {"items": [], "address": ""}},
             {"phone": "1", "role": "customer", "business_id": "biz_default"},
             "english",
@@ -850,7 +850,7 @@ class AgentSimulationTests(unittest.TestCase):
         try:
             tools_mod.build_order_preview = lambda items, address, style="english", business_id="biz_default": {"message": f"Preview for {address}"}
             observation = tools_mod._tool_collect_address(
-                {"address": "K.T House, Iriya P.O"},
+                {"address": "K.T House, Iriya P.O, Near Temple, 671531"},
                 {"cart": {"items": [{"name": "boots", "qty": 1}], "address": ""}},
                 {"phone": "1", "role": "customer", "business_id": "biz_default"},
                 "english",
@@ -858,6 +858,7 @@ class AgentSimulationTests(unittest.TestCase):
             self.assertTrue(observation.ok)
             self.assertIn("Preview for", observation.message)
             self.assertEqual(observation.data["normalized_address"]["address_line"], "K.T House")
+            self.assertEqual(observation.data["normalized_address"]["pincode"], "671531")
         finally:
             tools_mod.build_order_preview = original_preview
 
@@ -935,7 +936,7 @@ class AgentSimulationTests(unittest.TestCase):
         finally:
             tools_mod.get_tool_policy_stats = original_stats
 
-    def test_repeated_collect_address_failure_unlocks_workflow(self) -> None:
+    def test_repeated_collect_address_failure_stops_with_strict_fallback(self) -> None:
         import app.services.agent.main_agent as main_mod
 
         original_choose_next_action = main_mod.choose_next_action
@@ -967,8 +968,8 @@ class AgentSimulationTests(unittest.TestCase):
                     style="english",
                 )
             )
-            self.assertEqual(result.reply, "cart updated")
-            self.assertGreaterEqual(result.updated_state.get("tool_failures", {}).get("collect_address", 0), 2)
+            self.assertIn("full address", result.reply.lower())
+            self.assertGreaterEqual(result.updated_state.get("tool_failures", {}).get("collect_address", 0), 1)
         finally:
             main_mod.choose_next_action = original_choose_next_action
             main_mod.execute_tool = original_execute_tool

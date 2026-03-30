@@ -1,29 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-OPENAI_MODELS = {
-    "cheap": os.getenv("OPENAI_CHEAP_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
-    "balanced": os.getenv("OPENAI_BALANCED_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
-    "smart": os.getenv("OPENAI_SMART_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")),
-}
-GEMINI_MODELS = {
-    "cheap": os.getenv("GEMINI_CHEAP_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
-    "balanced": os.getenv("GEMINI_BALANCED_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
-    "smart": os.getenv("GEMINI_SMART_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")),
-}
-
-PROVIDER_BACKOFF_UNTIL: Dict[str, float] = {"openai": 0.0, "gemini": 0.0}
+from app.core.settings import get_settings
+from app.services.resilience import ResilientClientError, get_resilient_caller
 
 
 def _log_llm(event: str, **details: Any) -> None:
@@ -38,170 +22,126 @@ def call_llm(
     temperature: float = 0.2,
     tier: str = "balanced",
 ) -> str:
-    provider = _select_provider(tier)
-    _log_llm(
-        "call_llm_start",
-        provider=provider,
-        tier=tier,
-        json_mode=json_mode,
-        temperature=temperature,
-        message_count=len(messages),
-        preview=(messages[-1].get("content", "")[:160] if messages else ""),
-    )
-    content = _dispatch(provider, messages, json_mode=json_mode, temperature=temperature, tier=tier)
-    _log_llm("call_llm_success", provider=provider, tier=tier, response_preview=content[:240])
-    if not json_mode:
-        return content
-    normalized = normalize_llm_json(content)
-    if normalized:
-        return json.dumps(normalized, ensure_ascii=False)
-    return json.dumps(
-        {
-            "thought": "fallback",
-            "action": "respond",
-            "arguments": {},
-            "message": safe_user_facing_text(content) or "Please tell me a bit more.",
-            "confidence": 0.25,
-        },
-        ensure_ascii=False,
-    )
+    provider = _select_provider()
+    _log_llm("call_llm_start", provider=provider, tier=tier, json_mode=json_mode, temperature=temperature, message_count=len(messages))
+    if provider == "openai":
+        return _call_openai(messages, json_mode=json_mode, temperature=temperature, tier=tier)
+    return _call_gemini(messages, json_mode=json_mode, temperature=temperature, tier=tier)
 
 
 def call_agent_llm(messages: List[Dict[str, str]], *, tier: str = "balanced") -> Dict[str, Any]:
-    _log_llm("call_agent_llm_start", tier=tier, message_count=len(messages))
+    settings = get_settings()
+    if settings.openai_api_key:
+        try:
+            return _call_openai_planner_tool(messages, tier=tier)
+        except Exception as exc:
+            _log_llm("tool_call_failed", tier=tier, error=str(exc))
     raw = call_llm(messages, json_mode=True, temperature=0.15 if tier == "cheap" else 0.2, tier=tier)
     try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict) and "message" in parsed:
-            parsed["message"] = safe_user_facing_text(parsed.get("message", ""))
-        _log_llm("call_agent_llm_success", tier=tier, action=parsed.get("action"), confidence=parsed.get("confidence"))
-        return parsed
+        payload = json.loads(raw)
     except json.JSONDecodeError:
-        _log_llm("call_agent_llm_parse_fallback", tier=tier, raw_preview=raw[:240])
-        return {"thought": "parse_fallback", "action": "respond", "arguments": {}, "message": safe_user_facing_text(raw), "confidence": 0.25}
+        payload = {"thought": "parse_fallback", "action": "respond", "arguments": {}, "message": safe_user_facing_text(raw), "confidence": 0.25}
+    payload["message"] = safe_user_facing_text(payload.get("message", ""))
+    return _normalize_payload(payload)
 
 
-def _select_provider(tier: str = "balanced") -> str:
-    configured = os.getenv("LLM_PROVIDER", "auto").strip().lower()
-    has_openai = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
-
-    if configured == "openai":
-        if not has_openai:
-            raise RuntimeError("LLM_PROVIDER=openai but OPENAI_API_KEY is missing.")
+def _select_provider() -> str:
+    settings = get_settings()
+    if settings.openai_api_key:
         return "openai"
-    if configured == "gemini":
-        if not has_gemini:
-            raise RuntimeError("LLM_PROVIDER=gemini but GEMINI_API_KEY is missing.")
-        return "gemini"
-    preferred = os.getenv("LLM_PROVIDER_PRIORITY", "openai,gemini").split(",")
-    preferred = [item.strip().lower() for item in preferred if item.strip()]
-    for provider in preferred:
-        if _provider_in_backoff(provider):
-            _log_llm("provider_backoff_skip", provider=provider, tier=tier, wait_seconds=round(PROVIDER_BACKOFF_UNTIL.get(provider, 0.0) - time.time(), 2))
-            continue
-        if provider == "openai" and has_openai:
-            _log_llm("provider_selected", provider="openai", tier=tier, mode="preferred")
-            return "openai"
-        if provider == "gemini" and has_gemini:
-            _log_llm("provider_selected", provider="gemini", tier=tier, mode="preferred")
-            return "gemini"
-    if has_openai and not _provider_in_backoff("openai"):
-        _log_llm("provider_selected", provider="openai", tier=tier, mode="fallback")
-        return "openai"
-    if has_gemini and not _provider_in_backoff("gemini"):
-        _log_llm("provider_selected", provider="gemini", tier=tier, mode="fallback")
-        return "gemini"
-    if has_openai or has_gemini:
-        raise RuntimeError("Configured LLM providers are temporarily in backoff after recent failures.")
-    raise RuntimeError("No LLM provider is configured. Set OPENAI_API_KEY or GEMINI_API_KEY.")
-
-
-def _dispatch(provider: str, messages: List[Dict[str, str]], *, json_mode: bool, temperature: float, tier: str) -> str:
-    if _provider_in_backoff(provider):
-        raise RuntimeError(f"{provider} is temporarily in backoff.")
-    try:
-        _log_llm("provider_attempt", provider=provider, tier=tier, json_mode=json_mode)
-        if provider == "openai":
-            return _call_openai(messages, json_mode=json_mode, temperature=temperature, tier=tier)
-        return _call_gemini(messages, json_mode=json_mode, temperature=temperature, tier=tier)
-    except Exception as exc:
-        _log_llm("provider_attempt_failed", provider=provider, tier=tier, error=str(exc))
-        raise
+    if settings.environment != "test":
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+    return "openai"
 
 
 def _call_openai(messages: List[Dict[str, str]], *, json_mode: bool, temperature: float, tier: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = OPENAI_MODELS.get(tier, OPENAI_MODELS["balanced"])
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
+    settings = get_settings()
+    model = settings.openai_models.get("strong" if tier == "smart" else tier, settings.openai_models["balanced"])
+    payload: Dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+
     request = urllib.request.Request(
-        OPENAI_API_URL,
+        settings.openai_api_url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        _log_llm("external_api_request", provider="openai", model=model, tier=tier, json_mode=json_mode, prompt_chars=sum(len(message.get("content", "")) for message in messages))
-        with urllib.request.urlopen(request, timeout=40) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        _mark_provider_backoff("openai", detail)
-        _log_llm("external_api_error", provider="openai", model=model, tier=tier, error=f"{exc.code} {detail[:240]}")
-        raise RuntimeError(f"OpenAI request failed: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        _log_llm("external_api_error", provider="openai", model=model, tier=tier, error=str(exc.reason))
-        raise RuntimeError(f"OpenAI request failed: {exc.reason}") from exc
-    _log_llm("external_api_response", provider="openai", model=model, tier=tier, choice_count=len(data.get("choices", [])))
-    return data["choices"][0]["message"]["content"].strip()
+
+    def _request() -> str:
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"OpenAI request failed: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI request failed: {exc.reason}") from exc
+        return data["choices"][0]["message"]["content"].strip()
+
+    return get_resilient_caller("openai-chat", max_retries=2).call(_request)
+
+
+def _call_openai_planner_tool(messages: List[Dict[str, str]], *, tier: str) -> Dict[str, Any]:
+    settings = get_settings()
+    model = settings.openai_models.get("strong" if tier in {"smart", "strong"} else tier, settings.openai_models["balanced"])
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "plan_agent_step",
+            "description": "Choose the next deterministic tool call or direct response for the commerce agent.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "thought": {"type": "string"},
+                    "action": {"type": "string"},
+                    "message": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "uncertainty": {"type": "number"},
+                    "arguments": {"type": "object"},
+                    "plan_steps": {"type": "array", "items": {"type": "object"}},
+                    "goal": {"type": "object"},
+                },
+                "required": ["action", "arguments", "message", "confidence", "uncertainty"],
+            },
+        },
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.1,
+        "tools": [tool_schema],
+        "tool_choice": {"type": "function", "function": {"name": "plan_agent_step"}},
+    }
+    request = urllib.request.Request(
+        settings.openai_api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+
+    def _request() -> Dict[str, Any]:
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"OpenAI planner tool failed: {exc.code} {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI planner tool failed: {exc.reason}") from exc
+        message = data["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            raise RuntimeError("Planner returned no tool call.")
+        arguments = tool_calls[0]["function"]["arguments"]
+        return _normalize_payload(json.loads(arguments))
+
+    return get_resilient_caller("openai-planner", max_retries=2).call(_request)
 
 
 def _call_gemini(messages: List[Dict[str, str]], *, json_mode: bool, temperature: float, tier: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = GEMINI_MODELS.get(tier, GEMINI_MODELS["balanced"])
-    prompt = _messages_to_text(messages, json_mode=json_mode)
-    payload: Dict[str, Any] = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature},
-    }
-    request = urllib.request.Request(
-        GEMINI_API_URL.format(model=model, api_key=api_key),
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        _log_llm("external_api_request", provider="gemini", model=model, tier=tier, json_mode=json_mode, prompt_chars=len(prompt))
-        with urllib.request.urlopen(request, timeout=40) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        _mark_provider_backoff("gemini", detail)
-        _log_llm("external_api_error", provider="gemini", model=model, tier=tier, error=f"{exc.code} {detail[:240]}")
-        raise RuntimeError(f"Gemini request failed: {exc.code} {detail}") from exc
-    except urllib.error.URLError as exc:
-        _log_llm("external_api_error", provider="gemini", model=model, tier=tier, error=str(exc.reason))
-        raise RuntimeError(f"Gemini request failed: {exc.reason}") from exc
-    _log_llm("external_api_response", provider="gemini", model=model, tier=tier, candidate_count=len(data.get("candidates", [])))
-    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    return "\n".join(str(part.get("text", "")) for part in parts).strip()
-
-
-def _messages_to_text(messages: List[Dict[str, str]], *, json_mode: bool) -> str:
-    rendered = [f"{message.get('role', 'user').upper()}: {message.get('content', '')}" for message in messages]
-    prompt = "\n\n".join(rendered)
-    if json_mode:
-        prompt += (
-            "\n\nReturn a single JSON object with keys thought, action, arguments, message, confidence. "
-            "Do not include markdown fences."
-        )
-    return prompt
+    raise RuntimeError("Gemini is no longer used in this runtime.")
 
 
 def normalize_llm_json(text: str) -> Optional[Dict[str, Any]]:
@@ -233,7 +173,7 @@ def extract_first_json_object(text: str) -> Optional[str]:
 
 
 def safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    candidate = text.strip()
+    candidate = str(text or "").strip()
     if candidate.startswith("```"):
         candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
         candidate = re.sub(r"\s*```$", "", candidate)
@@ -250,20 +190,25 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     arguments = payload.get("arguments")
     if not isinstance(arguments, dict):
         arguments = {}
-    action = payload.get("action")
-    if action is not None:
-        action = str(action).strip() or "respond"
     confidence = payload.get("confidence")
+    uncertainty = payload.get("uncertainty")
     try:
         confidence_value = float(confidence)
     except (TypeError, ValueError):
         confidence_value = 0.4
+    try:
+        uncertainty_value = float(uncertainty)
+    except (TypeError, ValueError):
+        uncertainty_value = max(0.0, 1.0 - confidence_value)
     return {
         "thought": str(payload.get("thought") or "").strip(),
-        "action": action or "respond",
+        "action": str(payload.get("action") or "respond").strip() or "respond",
         "arguments": arguments,
         "message": safe_user_facing_text(payload.get("message") or ""),
         "confidence": max(0.0, min(confidence_value, 1.0)),
+        "uncertainty": max(0.0, min(uncertainty_value, 1.0)),
+        "plan_steps": list(payload.get("plan_steps") or []),
+        "goal": dict(payload.get("goal") or {}),
     }
 
 
@@ -280,54 +225,22 @@ def safe_user_facing_text(value: Any) -> str:
         return "Please tell me a bit more so I can help properly."
     if any(marker in text for marker in ['"thought"', '"action"', '"arguments"', '"confidence"']):
         return "Please tell me a bit more so I can help properly."
-    compact = text.replace("\n", " ").strip()
-    return compact[:1500]
-
-
-def _provider_in_backoff(provider: str) -> bool:
-    return PROVIDER_BACKOFF_UNTIL.get(provider, 0.0) > time.time()
-
-
-def _mark_provider_backoff(provider: str, detail: str) -> None:
-    lowered = str(detail or "").lower()
-    if "429" not in lowered and "quota" not in lowered and "rate limit" not in lowered and "resource_exhausted" not in lowered:
-        return
-    retry_seconds = _extract_retry_seconds(detail)
-    PROVIDER_BACKOFF_UNTIL[provider] = max(PROVIDER_BACKOFF_UNTIL.get(provider, 0.0), time.time() + retry_seconds)
-    _log_llm("provider_backoff_set", provider=provider, wait_seconds=retry_seconds)
-
-
-def _extract_retry_seconds(detail: str) -> float:
-    text = str(detail or "")
-    for pattern in (r'"retryDelay"\s*:\s*"(\d+)s"', r"retry in\s+(\d+(?:\.\d+)?)s"):
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            try:
-                return max(5.0, min(float(match.group(1)), 180.0))
-            except ValueError:
-                break
-    return 45.0
+    return text.replace("\n", " ").strip()[:1500]
 
 
 def detect_language_style(message: str) -> str:
     if re.search(r"[\u0D00-\u0D7F]", message):
         return "malayalam"
     lowered = message.lower()
-    manglish_markers = [
-        "cheyyu", "cheythu", "ayi", "undo", "venam", "vende", "nale", "innu", "entha",
-        "enthaanu", "aaki", "eduthu", "tharuo", "kodukku", "evide", "poyi", "ishtam",
-        "venel", "alle", "aayal", "ningalude", "sadhanam", "sheri",
-    ]
+    manglish_markers = ["cheyyu", "cheythu", "ayi", "undo", "venam", "vende", "nale", "innu", "entha", "ningalude", "sheri"]
     if any(token in lowered for token in manglish_markers):
         return "manglish"
     return "english"
 
 
 def is_confirmation_yes(message: str) -> bool:
-    lowered = message.strip().lower()
-    return lowered in {"yes", "y", "ok", "okay", "confirm", "confirmed", "proceed", "sure", "aam", "athe", "sheri"}
+    return message.strip().lower() in {"yes", "y", "ok", "okay", "confirm", "confirmed", "proceed", "sure", "aam", "athe", "sheri"}
 
 
 def is_confirmation_no(message: str) -> bool:
-    lowered = message.strip().lower()
-    return lowered in {"no", "n", "cancel", "stop", "not now", "venda", "illa"}
+    return message.strip().lower() in {"no", "n", "cancel", "stop", "not now", "venda", "illa"}

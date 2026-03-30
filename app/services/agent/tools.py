@@ -52,11 +52,14 @@ from app.services.vendor import (
     get_active_promotions,
     get_business_profile,
     get_customer_broadcast_targets,
+    filter_orders,
+    list_orders,
     get_product_catalog,
     get_product_details,
     normalize_product_name,
     notify_customer_order_update,
     send_vendor_order_notification,
+    summarize_business,
     update_business_profile,
     update_product,
     update_product_offer,
@@ -83,6 +86,9 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "create_support_ticket": {"description": "Create or update a support ticket for an issue.", "roles": {"customer"}, "domains": {"support"}, "internal": False, "base_score": 0.95},
     "recommend_products": {"description": "Recommend next-best products using personalization, exploration, and affinity.", "roles": {"customer"}, "domains": {"sales"}, "internal": False, "base_score": 0.78},
     "vendor_update_order_status": {"description": "Update vendor order status from natural language intent.", "roles": {"vendor"}, "domains": {"order", "support"}, "internal": False, "base_score": 0.96},
+    "list_orders": {"description": "List recent orders for the business.", "roles": {"vendor"}, "domains": {"order"}, "internal": False, "base_score": 0.76},
+    "filter_orders": {"description": "Filter business orders by status.", "roles": {"vendor"}, "domains": {"order"}, "internal": False, "base_score": 0.8},
+    "summarize_business": {"description": "Summarize business health and analytics.", "roles": {"vendor"}, "domains": {"sales", "order", "support"}, "internal": False, "base_score": 0.72},
     "resolve_support_ticket": {"description": "Resolve an existing support ticket and notify the customer.", "roles": {"vendor"}, "domains": {"support"}, "internal": False, "base_score": 0.92},
     "manage_product": {"description": "Add, update, or deactivate a product.", "roles": {"vendor"}, "domains": {"sales"}, "internal": False, "base_score": 0.84},
     "create_offer": {"description": "Set an offer price for a product.", "roles": {"vendor"}, "domains": {"sales"}, "internal": False, "base_score": 0.78},
@@ -262,6 +268,9 @@ def execute_tool(
         "create_support_ticket": _tool_create_support_ticket,
         "recommend_products": _tool_recommend_products,
         "vendor_update_order_status": _tool_vendor_update_order_status,
+        "list_orders": _tool_list_orders,
+        "filter_orders": _tool_filter_orders,
+        "summarize_business": _tool_summarize_business,
         "resolve_support_ticket": _tool_resolve_support_ticket,
         "manage_product": _tool_manage_product,
         "create_offer": _tool_create_offer,
@@ -689,6 +698,34 @@ def _tool_vendor_update_order_status(args: Dict[str, Any], state: Dict[str, Any]
     return ToolObservation(tool="vendor_update_order_status", ok=True, message=generate_vendor_acknowledgement(updated, style, status), data={"order_id": updated.orderId, "status": status}, state_patch={"last_vendor_order_id": updated.orderId})
 
 
+def _tool_list_orders(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    rows = list_orders(user.get("business_id", DEFAULT_BUSINESS_ID), limit=int(args.get("limit") or 10))
+    if not rows:
+        return ToolObservation(tool="list_orders", ok=True, message=style_text(style, "No recent orders found.", "Recent orders onnum illa.", "Recent orders onnum illa."), data={"orders": []})
+    lines = [f"{row['order_id']} | {row['status']} | Rs {row['total']:.2f}" for row in rows]
+    return ToolObservation(tool="list_orders", ok=True, message="\n".join(lines), data={"orders": rows})
+
+
+def _tool_filter_orders(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    status = str(args.get("status") or "").strip().lower()
+    rows = filter_orders(user.get("business_id", DEFAULT_BUSINESS_ID), status=status, limit=int(args.get("limit") or 10))
+    if not rows:
+        return ToolObservation(tool="filter_orders", ok=True, message=style_text(style, f"No {status or 'matching'} orders found.", f"{status or 'matching'} orders onnum illa.", f"{status or 'matching'} orders onnum illa."), data={"orders": [], "status": status})
+    lines = [f"{row['order_id']} | {row['status']} | Rs {row['total']:.2f}" for row in rows]
+    return ToolObservation(tool="filter_orders", ok=True, message="\n".join(lines), data={"orders": rows, "status": status})
+
+
+def _tool_summarize_business(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
+    summary = summarize_business(user.get("business_id", DEFAULT_BUSINESS_ID))
+    message = (
+        f"Orders: {summary['order_count']}\n"
+        f"Pending: {summary['pending_orders']}\n"
+        f"Products: {summary['product_count']}\n"
+        f"Open Support: {summary['support_open']}"
+    )
+    return ToolObservation(tool="summarize_business", ok=True, message=message, data=summary)
+
+
 def _tool_resolve_support_ticket(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:
     ticket_id = str(args.get("ticket_id") or state.get("open_ticket_id") or "").strip()
     resolution = str(args.get("resolution") or "Issue resolved").strip()
@@ -700,7 +737,14 @@ def _tool_resolve_support_ticket(args: Dict[str, Any], state: Dict[str, Any], us
     get_collection("support_tickets").update_one({"_id": ticket["_id"]}, {"$set": {"status": "resolved", "resolution_notes": resolution, "resolved_at": utc_now(), "updated_at": utc_now()}})
     from app.services.vendor import send_whatsapp_message
     customer_style = style
-    send_whatsapp_message(ticket["customer_phone"], style_text(customer_style, f"Your issue has been resolved. Ticket {ticket_id}: {resolution}", f"Ningalude issue solve cheythu. Ticket {ticket_id}: {resolution}", f"നിങ്ങളുടെ പ്രശ്നം പരിഹരിച്ചു. Ticket {ticket_id}: {resolution}"), from_number=get_business_profile(user.get("business_id", DEFAULT_BUSINESS_ID)).get("whatsapp_number"))
+    send_whatsapp_message(
+        ticket["customer_phone"],
+        style_text(customer_style, f"Your issue has been resolved. Ticket {ticket_id}: {resolution}", f"Ningalude issue solve cheythu. Ticket {ticket_id}: {resolution}", f"നിങ്ങളുടെ പ്രശ്നം പരിഹരിച്ചു. Ticket {ticket_id}: {resolution}"),
+        from_number=get_business_profile(user.get("business_id", DEFAULT_BUSINESS_ID)).get("whatsapp_number"),
+        business_id=user.get("business_id", DEFAULT_BUSINESS_ID),
+        notification_type="support_resolution",
+        metadata={"ticket_id": ticket_id},
+    )
     record_event("support_ticket_resolved", business_id=user.get("business_id", DEFAULT_BUSINESS_ID), phone=ticket["customer_phone"], payload={"ticket_id": ticket_id})
     return ToolObservation(tool="resolve_support_ticket", ok=True, message=style_text(style, f"Ticket {ticket_id} resolved.", f"Ticket {ticket_id} resolve cheythu.", f"Ticket {ticket_id} പരിഹരിച്ചു."), data={"ticket_id": ticket_id}, state_patch={"open_ticket_id": ""})
 
@@ -757,6 +801,7 @@ def _tool_send_broadcast(args: Dict[str, Any], state: Dict[str, Any], user: Dict
 def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[str, Any], learning: Dict[str, Any]) -> tuple[List[Dict[str, Any]], List[str], List[str]]:
     catalog = get_product_catalog(business_id=business_id, limit=100)
     exact_map = {str(item.get("name") or "").strip().lower(): item for item in catalog}
+    display_map = {str(item.get("display_name") or "").strip().lower(): item for item in catalog}
     normalized_map = {normalize_product_name(str(item.get("name") or "")): item for item in catalog}
     resolved: List[Dict[str, Any]] = []
     missing: List[str] = []
@@ -767,7 +812,7 @@ def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[
         if not requested:
             continue
         lowered = requested.lower()
-        product = exact_map.get(lowered) or get_product_details(requested, business_id=business_id)
+        product = exact_map.get(lowered) or display_map.get(lowered) or get_product_details(requested, business_id=business_id)
         if product:
             resolved.append({"name": product["name"], "qty": qty})
             continue
@@ -775,15 +820,11 @@ def _resolve_items(items: List[Dict[str, Any]], business_id: str, profile: Dict[
         if normalized_product:
             resolved.append({"name": normalized_product["name"], "qty": qty})
             continue
-        ranked = rank_products(requested, catalog, profile=profile, learning_profile=learning)
-        ranked = sorted(ranked, key=lambda row: float(((row.get("ranking") or {}).get("score")) or 0.0), reverse=True)
-        best_ranked = ranked[0] if ranked else None
-        best_score = float(((best_ranked or {}).get("ranking") or {}).get("score") or 0.0)
-        second_score = float(((ranked[1] if len(ranked) > 1 else {}).get("ranking") or {}).get("score") or 0.0)
-        if best_ranked and best_score >= 0.68 and (best_score - second_score) >= 0.16:
-            resolved.append({"name": best_ranked["name"], "qty": qty})
-        elif ranked[:2]:
-            candidate_names = ", ".join(str(candidate.get("display_name") or candidate.get("name") or "").strip() for candidate in ranked[:2] if candidate.get("name"))
+        prefix_matches = [row for row in catalog if normalize_product_name(requested) in {row["name"], normalize_product_name(str(row.get("display_name") or ""))} or row["name"].startswith(normalize_product_name(requested))]
+        if len(prefix_matches) == 1:
+            resolved.append({"name": prefix_matches[0]["name"], "qty": qty})
+        elif prefix_matches[:2]:
+            candidate_names = ", ".join(str(candidate.get("display_name") or candidate.get("name") or "").strip() for candidate in prefix_matches[:2] if candidate.get("name"))
             ambiguous.append(f"{requested} ({candidate_names})" if candidate_names else requested)
         else:
             missing.append(requested)
@@ -846,7 +887,12 @@ def vendor_status_candidates(message: str, business_id: str, learning_profile: O
             continue
         for token in lowered.split():
             scores[status] += float(weights.get(token, 0)) / 10.0
-    hints = {"accepted": ["accept", "okay", "ok", "confirmed"], "rejected": ["reject", "cancel", "cannot", "cant"], "out_for_delivery": ["dispatch", "sending", "on the way"], "delivered": ["delivered", "done", "completed", "reached"]}
+    hints = {
+        "accepted": ["accept", "accepted", "okay", "ok", "confirmed", "ready", "shari", "sheri"],
+        "rejected": ["reject", "rejected", "cancel", "cannot", "cant", "illa", "pattila"],
+        "out_for_delivery": ["dispatch", "dispatched", "dispatch cheythu", "sending", "on the way", "vittu", "ayachu"],
+        "delivered": ["delivered", "done", "completed", "reached", "kitty", "kitti", "ethi"],
+    }
     for status, tokens in hints.items():
         for token in tokens:
             if token in lowered:
@@ -871,6 +917,12 @@ def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dic
             message="",
             error=style_text(style, "That doesn't look like a full delivery address yet. Please send the house/building, area, and landmark or PIN.", "Ithu full delivery address pole thonnunnilla. House/building, area, landmark allenkil PIN ayakku.", "ഇത് പൂർണ്ണമായ ഡെലിവറി വിലാസമായി തോന്നുന്നില്ല. വീട്/ബിൽഡിംഗ്, ഏരിയ, ലാൻഡ്മാർക്ക് അല്ലെങ്കിൽ പിൻ അയയ്ക്കൂ."),
         )
+    address_payload = {
+        "address_line": normalized.get("address_line", ""),
+        "area": normalized.get("area", ""),
+        "landmark": normalized.get("landmark", ""),
+        "pincode": normalized.get("pincode", ""),
+    }
     address = str(normalized.get("normalized") or raw_address)
     cart["address"] = address
     cart["updated_at"] = utc_now().isoformat()
@@ -889,7 +941,7 @@ def _tool_collect_address(args: Dict[str, Any], state: Dict[str, Any], user: Dic
     if items:
         preview = build_order_preview(items, address, style=style, business_id=user.get("business_id", DEFAULT_BUSINESS_ID))
         message = preview["message"]
-    return ToolObservation(tool="collect_address", ok=True, message=message, data={"address": address, "normalized_address": normalized, "items": items}, state_patch=state_patch)
+    return ToolObservation(tool="collect_address", ok=True, message=message, data={"address": address, "normalized_address": address_payload, "items": items}, state_patch=state_patch)
 
 
 def _tool_repair_order_context(args: Dict[str, Any], state: Dict[str, Any], user: Dict[str, Any], style: str) -> ToolObservation:

@@ -212,6 +212,12 @@ def route_by_intent(intent: str, message: str, context: Dict[str, Any]) -> str |
     lowered = str(message or "").strip().lower()
     workflow = context.get("workflow") or {}
     analysis = context.get("analysis") or {}
+    if any(term in lowered for term in {"list orders", "show orders", "recent orders"}):
+        return "list_orders"
+    if any(term in lowered for term in {"pending orders", "delivered orders", "accepted orders", "rejected orders"}):
+        return "filter_orders"
+    if any(term in lowered for term in {"analytics", "summary", "business summary"}):
+        return "summarize_business"
     if intent == "browse":
         return "search_catalog"
     if intent == "order_status":
@@ -265,6 +271,17 @@ def _decision_for_routed_action(action: str, message: str, state: Dict[str, Any]
         return PlannerDecision(action="collect_address", arguments={"address": message, "raw_message": message}, rationale="intent_fallback_route", confidence=0.78)
     if action == "inspect_support_context":
         return PlannerDecision(action="inspect_support_context", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.8)
+    if action == "list_orders":
+        return PlannerDecision(action="list_orders", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.82)
+    if action == "filter_orders":
+        status = ""
+        for candidate in ["pending", "accepted", "rejected", "delivered"]:
+            if candidate in lowered:
+                status = candidate
+                break
+        return PlannerDecision(action="filter_orders", arguments={"status": status, "raw_message": message}, rationale="intent_safety_route", confidence=0.82)
+    if action == "summarize_business":
+        return PlannerDecision(action="summarize_business", arguments={"raw_message": message}, rationale="intent_safety_route", confidence=0.8)
     return PlannerDecision(
         action="respond",
         message=style_text(state.get("lastLanguage", "english"), "Tell me what you need help with, and I will handle it.", "Entha sahayam venam enn parayu, njan handle cheyyam.", "Entha sahayam venam enn parayu, njan handle cheyyam."),

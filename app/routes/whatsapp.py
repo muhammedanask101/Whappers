@@ -1,53 +1,39 @@
-from fastapi import APIRouter, Form, HTTPException, Response, status, Request
+from __future__ import annotations
+
 import time
+from typing import Any
 
-from app.services.agent.controller import process_incoming_message
-from app.services.llm import safe_user_facing_text
-from app.services.vendor import (
-    get_business_by_vendor_phone,
-    get_business_by_whatsapp_number,
-    normalize_phone,
-    send_whatsapp_message,
-)
-
-from twilio.request_validator import RequestValidator
-import os
-from dotenv import load_dotenv
-
+from fastapi import APIRouter, Form, HTTPException, Request, Response, status
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from fastapi import Request
+from twilio.request_validator import RequestValidator
 
-limiter = Limiter(key_func=get_remote_address)
+from app.core.settings import get_settings
+from app.services.agent.controller import process_incoming_message
+from app.services.llm import safe_user_facing_text
+from app.services.vendor import get_business_by_vendor_phone, get_business_by_whatsapp_number, normalize_phone, send_whatsapp_message_async
 
-load_dotenv()
-
-# 🔐 Secure token loading
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-if not TWILIO_AUTH_TOKEN:
-    raise ValueError("TWILIO_AUTH_TOKEN not set in environment")
-
-validator = RequestValidator(TWILIO_AUTH_TOKEN)
 
 router = APIRouter(tags=["whatsapp"])
+limiter = Limiter(key_func=get_remote_address)
 _RECENT_WEBHOOKS: dict[str, float] = {}
 
 
-def _log_whatsapp(event: str, **details):
+def _log_whatsapp(event: str, **details: Any) -> None:
     normalized = " ".join(f"{key}={repr(value)}" for key, value in details.items())
     print(f"[route.whatsapp] {event} {normalized}".rstrip())
 
 
-# 🔐 Verify Twilio request
-async def verify_request(request: Request):
+async def verify_request(request: Request) -> bool:
+    settings = get_settings()
+    if settings.debug_mode or settings.environment != "prod":
+        return True
+    if not settings.twilio_auth_token:
+        return False
+    validator = RequestValidator(settings.twilio_auth_token)
     signature = request.headers.get("X-Twilio-Signature", "")
     form = await request.form()
-
-    return validator.validate(
-        str(request.url),
-        dict(form),
-        signature
-    )
+    return validator.validate(str(request.url), dict(form), signature)
 
 
 def _resolve_business(sender: str, recipient: str):
@@ -78,53 +64,40 @@ async def whatsapp_webhook(
     To: str = Form(""),
     MessageSid: str = Form(""),
 ) -> Response:
-    _log_whatsapp("webhook_received", from_number=From, to_number=To, body_preview=Body[:240], env=os.getenv("ENV"))
-
-    # 🔐 Security check (skip in dev if needed)
-    if os.getenv("ENV") == "prod":
-        if not await verify_request(request):
-            raise HTTPException(status_code=403, detail="Unauthorized")
-
+    _log_whatsapp("webhook_received", from_number=From, to_number=To, body_preview=Body[:240])
+    if not await verify_request(request):
+        raise HTTPException(status_code=403, detail="Unauthorized")
     if not Body or not From:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing Twilio WhatsApp webhook fields."
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing Twilio WhatsApp webhook fields.")
 
     sender = normalize_phone(From)
     recipient = normalize_phone(To)
     if _is_duplicate_webhook(MessageSid, sender, Body):
-        _log_whatsapp("webhook_duplicate_ignored", sender=sender, message_sid=MessageSid, body_preview=Body[:120])
+        _log_whatsapp("webhook_duplicate_ignored", sender=sender, message_sid=MessageSid)
         return Response(content="", media_type="text/plain", status_code=200)
 
     business = _resolve_business(sender, recipient)
     if not business:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No active business matched this WhatsApp channel."
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active business matched this WhatsApp channel.")
 
     role = "vendor" if sender == business.get("vendor_phone") else "customer"
-    _log_whatsapp("business_resolved", sender=sender, recipient=recipient, business_id=business.get("business_id"), role=role)
+    graceful_reply = "We received your message. Please try again shortly."
+    try:
+        reply = await process_incoming_message(
+            Body,
+            {"phone": sender, "role": role, "business_id": business["business_id"], "business_name": business["name"]},
+        )
+        reply = safe_user_facing_text(reply)[:1500] or graceful_reply
+    except Exception as exc:
+        _log_whatsapp("agent_failed", sender=sender, business_id=business.get("business_id"), error=str(exc))
+        reply = graceful_reply
 
-    reply = await process_incoming_message(
-        Body,
-        {
-            "phone": sender,
-            "role": role,
-            "business_id": business["business_id"],
-            "business_name": business["name"],
-        },
-    )
-    reply = safe_user_facing_text(reply)[:1500]
-
-    _log_whatsapp("reply_ready", sender=sender, role=role, reply_preview=reply[:240])
-
-    send_whatsapp_message(
+    send_result = await send_whatsapp_message_async(
         sender,
         reply,
-        from_number=business.get("whatsapp_number")
+        from_number=business.get("whatsapp_number"),
+        business_id=business.get("business_id"),
+        notification_type="customer_reply" if role == "customer" else "vendor_reply",
     )
-    _log_whatsapp("webhook_complete", sender=sender, business_id=business.get("business_id"))
-
+    _log_whatsapp("webhook_complete", sender=sender, business_id=business.get("business_id"), vendor_send_success=send_result.get("success"))
     return Response(content="", media_type="text/plain", status_code=200)
