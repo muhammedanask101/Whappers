@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 
 from app.services.agent.localization import contact_reply_prompt, style_text
@@ -36,6 +37,27 @@ async def run_agent(
     learning_profile: Dict[str, Any],
     style: str,
 ) -> AgentRunResult:
+    return await asyncio.to_thread(
+        _run_agent_sync,
+        user_message,
+        user,
+        state,
+        memory_payload,
+        profile,
+        learning_profile,
+        style,
+    )
+
+
+def _run_agent_sync(
+    user_message: str,
+    user: Dict[str, Any],
+    state: Dict[str, Any],
+    memory_payload: Dict[str, Any],
+    profile: Dict[str, Any],
+    learning_profile: Dict[str, Any],
+    style: str,
+) -> AgentRunResult:
     analysis = analyze_message(user_message, user=user, state=state, learning_profile=learning_profile)
     strategy = build_strategy(user=user, profile=profile, analysis=analysis, state=state)
     strategy["llm_tier"] = select_cost_tier(analysis, state, user)
@@ -49,6 +71,7 @@ async def run_agent(
     final_reply = ""
     working_state["tool_failures"] = dict(state.get("tool_failures") or {})
     working_state["llm_calls_this_run"] = 0
+    working_state["planner_second_pass_used"] = False
     working_state["last_tool_used"] = str(state.get("last_tool_used") or "")
     working_state["same_tool_counter"] = int(state.get("same_tool_counter") or 0)
     working_state["force_deterministic_fallback"] = False
@@ -73,6 +96,9 @@ async def run_agent(
                 "complexity": analysis.get("complexity"),
                 "goal_progress": (working_state.get("goal_tracking") or {}).get("progress_score", 0.0),
                 "reflection_failures": 0,
+                "planner_provider": "",
+                "planner_model": "",
+                "second_pass_used": False,
             },
             reflections=[],
         )
@@ -239,6 +265,9 @@ async def run_agent(
             "complexity": analysis.get("complexity"),
             "goal_progress": (working_state.get("goal_tracking") or {}).get("progress_score", 0.0),
             "reflection_failures": run_summary.get("failures", 0),
+            "planner_provider": str(decisions[-1].metadata.get("provider") if decisions else ""),
+            "planner_model": str(decisions[-1].metadata.get("model") if decisions else ""),
+            "second_pass_used": bool(working_state.get("planner_second_pass_used")),
         },
         reflections=reflections,
     )

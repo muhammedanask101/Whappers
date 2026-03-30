@@ -138,6 +138,8 @@ def ensure_seed_data(database: Database) -> None:
     database["interaction_events"].create_index([("business_id", 1), ("kind", 1), ("created_at", -1)])
     database["automation_log"].create_index([("business_id", 1), ("phone", 1), ("created_at", -1)])
     database["automation_runs"].create_index([("business_id", 1), ("created_at", -1)])
+    database["webhook_dedupe"].create_index("key", unique=True)
+    database["webhook_dedupe"].create_index("created_at", expireAfterSeconds=60 * 60)
     database["vendor_notification_queue"].create_index([("business_id", 1), ("order_id", 1)], unique=True)
     database["promotions"].create_index([("business_id", 1), ("promotion_id", 1)], unique=True)
     database["events"].create_index([("business_id", 1), ("event_id", 1)], unique=True)

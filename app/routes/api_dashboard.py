@@ -10,13 +10,14 @@ from app.services.auth import (
     ROLE_BUSINESS_ADMIN,
     ROLE_SUPERADMIN,
     ensure_business_scope,
-    get_current_user,
+    get_current_api_user,
     require_feature_access,
     require_roles,
 )
 from app.services.dashboard import (
     add_catalog_product,
     create_business_with_subscription,
+    delete_business_with_context,
     get_activity_logs,
     get_admin_overview,
     get_business_analytics,
@@ -24,6 +25,8 @@ from app.services.dashboard import (
     get_business_list_with_context,
     get_global_analytics,
     get_onboarding_state,
+    get_support_tickets,
+    get_usage_summary,
     list_vendor_activity,
     query_orders,
     remove_catalog_product,
@@ -85,19 +88,19 @@ class OnboardingStepPayload(BaseModel):
 
 
 @router.get("/admin/overview")
-def admin_overview(user: dict = Depends(get_current_user)) -> dict:
+def admin_overview(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(get_admin_overview())
 
 
 @router.get("/admin/businesses")
-def admin_businesses(user: dict = Depends(get_current_user)) -> dict:
+def admin_businesses(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(get_business_list_with_context())
 
 
 @router.get("/admin/businesses/{business_id}")
-def admin_business_detail(business_id: str, user: dict = Depends(get_current_user)) -> dict:
+def admin_business_detail(business_id: str, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     business = get_business_detail_with_context(business_id)
     if not business:
@@ -106,18 +109,27 @@ def admin_business_detail(business_id: str, user: dict = Depends(get_current_use
 
 
 @router.post("/admin/businesses")
-def admin_create_business(payload: BusinessPayload, user: dict = Depends(get_current_user)) -> dict:
+def admin_create_business(payload: BusinessPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(create_business_with_subscription(payload.model_dump()))
 
 
 @router.put("/admin/businesses/{business_id}")
-def admin_update_business(business_id: str, payload: BusinessPayload, user: dict = Depends(get_current_user)) -> dict:
+def admin_update_business(business_id: str, payload: BusinessPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     business = update_business_with_context(business_id, payload.model_dump(exclude_unset=True))
     if not business:
         raise HTTPException(status_code=404, detail="Business not found.")
     return success_response(business)
+
+
+@router.delete("/admin/businesses/{business_id}")
+def admin_delete_business(business_id: str, user: dict = Depends(get_current_api_user)) -> dict:
+    require_roles(user, ROLE_SUPERADMIN)
+    business = delete_business_with_context(business_id)
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found.")
+    return success_response({"deleted": True, "business_id": business_id})
 
 
 @router.get("/admin/orders")
@@ -126,26 +138,26 @@ def admin_orders(
     status: str = Query(default=""),
     date_from: str = Query(default=""),
     date_to: str = Query(default=""),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_api_user),
 ) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(query_orders(business_id=business_id, status=status, date_from=date_from, date_to=date_to))
 
 
 @router.get("/admin/analytics")
-def admin_global_analytics(user: dict = Depends(get_current_user)) -> dict:
+def admin_global_analytics(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(get_global_analytics())
 
 
 @router.get("/admin/analytics/{business_id}")
-def admin_business_analytics(business_id: str, user: dict = Depends(get_current_user)) -> dict:
+def admin_business_analytics(business_id: str, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(get_business_analytics(business_id))
 
 
 @router.get("/admin/vendors")
-def admin_vendors(business_id: str = Query(default=""), user: dict = Depends(get_current_user)) -> dict:
+def admin_vendors(business_id: str = Query(default=""), user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     return success_response(list_vendor_activity(business_id))
 
@@ -154,7 +166,7 @@ def admin_vendors(business_id: str = Query(default=""), user: dict = Depends(get
 def admin_activity(
     business_id: str = Query(default=""),
     phone: str = Query(default=""),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_api_user),
 ) -> dict:
     require_roles(user, ROLE_SUPERADMIN)
     if not business_id:
@@ -162,8 +174,26 @@ def admin_activity(
     return success_response(get_activity_logs(business_id, phone=phone))
 
 
+@router.get("/admin/usage")
+def admin_usage(
+    business_id: str = Query(default=""),
+    user: dict = Depends(get_current_api_user),
+) -> dict:
+    require_roles(user, ROLE_SUPERADMIN)
+    return success_response(get_usage_summary(business_id))
+
+
+@router.get("/admin/support")
+def admin_support(
+    business_id: str = Query(default=""),
+    user: dict = Depends(get_current_api_user),
+) -> dict:
+    require_roles(user, ROLE_SUPERADMIN)
+    return success_response(get_support_tickets(business_id))
+
+
 @router.get("/business/me")
-def business_me(user: dict = Depends(get_current_user)) -> dict:
+def business_me(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     business = get_business_detail_with_context(business_id)
@@ -177,7 +207,7 @@ def business_orders(
     status: str = Query(default=""),
     date_from: str = Query(default=""),
     date_to: str = Query(default=""),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_api_user),
 ) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
@@ -185,21 +215,21 @@ def business_orders(
 
 
 @router.get("/business/catalog")
-def business_catalog(user: dict = Depends(get_current_user)) -> dict:
+def business_catalog(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(get_product_catalog(business_id=business_id, limit=100))
 
 
 @router.post("/business/catalog")
-def business_add_catalog(payload: ProductPayload, user: dict = Depends(get_current_user)) -> dict:
+def business_add_catalog(payload: ProductPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(add_catalog_product(business_id, payload.model_dump()))
 
 
 @router.put("/business/catalog/{product_name}")
-def business_update_catalog(product_name: str, payload: ProductPayload, user: dict = Depends(get_current_user)) -> dict:
+def business_update_catalog(product_name: str, payload: ProductPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     product = update_catalog_product(business_id, product_name, payload.model_dump(exclude_unset=True))
@@ -209,7 +239,7 @@ def business_update_catalog(product_name: str, payload: ProductPayload, user: di
 
 
 @router.delete("/business/catalog/{product_name}")
-def business_delete_catalog(product_name: str, user: dict = Depends(get_current_user)) -> dict:
+def business_delete_catalog(product_name: str, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     deleted = remove_catalog_product(business_id, product_name)
@@ -219,7 +249,7 @@ def business_delete_catalog(product_name: str, user: dict = Depends(get_current_
 
 
 @router.get("/business/performance")
-def business_performance(user: dict = Depends(get_current_user)) -> dict:
+def business_performance(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     require_feature_access(user, "performance")
@@ -227,21 +257,21 @@ def business_performance(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/business/settings")
-def business_settings(user: dict = Depends(get_current_user)) -> dict:
+def business_settings(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(get_business_profile(business_id))
 
 
 @router.put("/business/settings")
-def business_update_settings(payload: SettingsPayload, user: dict = Depends(get_current_user)) -> dict:
+def business_update_settings(payload: SettingsPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(update_business_profile(business_id=business_id, **payload.model_dump(exclude_unset=True)))
 
 
 @router.get("/business/vendors")
-def business_vendors(user: dict = Depends(get_current_user)) -> dict:
+def business_vendors(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     require_feature_access(user, "vendors")
     business_id = ensure_business_scope(user, user.get("business_id"))
@@ -249,14 +279,14 @@ def business_vendors(user: dict = Depends(get_current_user)) -> dict:
 
 
 @router.get("/onboarding/status")
-def onboarding_status(user: dict = Depends(get_current_user)) -> dict:
+def onboarding_status(user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(get_onboarding_state(business_id))
 
 
 @router.post("/onboarding/step")
-def onboarding_step(payload: OnboardingStepPayload, user: dict = Depends(get_current_user)) -> dict:
+def onboarding_step(payload: OnboardingStepPayload, user: dict = Depends(get_current_api_user)) -> dict:
     require_roles(user, ROLE_BUSINESS_ADMIN, ROLE_SUPERADMIN)
     business_id = ensure_business_scope(user, user.get("business_id"))
     return success_response(update_onboarding_state(business_id, step=payload.step, mark_complete=payload.mark_complete))

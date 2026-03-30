@@ -974,16 +974,18 @@ class AgentSimulationTests(unittest.TestCase):
             main_mod.choose_next_action = original_choose_next_action
             main_mod.execute_tool = original_execute_tool
 
-    def test_llm_provider_failure_does_not_retry_other_provider_same_call(self) -> None:
-        import app.services.llm as llm_mod
+    def test_llm_provider_failure_falls_back_to_gemini_same_call(self) -> None:
+        import app.services.llm.llm_router as router_mod
+        from app.core.settings import get_settings
 
         with patch.dict("os.environ", {"OPENAI_API_KEY": "x", "GEMINI_API_KEY": "y", "LLM_PROVIDER_PRIORITY": "openai,gemini"}, clear=False):
-            with patch.object(llm_mod, "_call_openai", side_effect=RuntimeError("quota")) as openai_call:
-                with patch.object(llm_mod, "_call_gemini", side_effect=AssertionError("should not be called")) as gemini_call:
-                    with self.assertRaises(RuntimeError):
-                        llm_mod.call_llm([{"role": "user", "content": "hi"}], json_mode=False, tier="balanced")
+            get_settings.cache_clear()
+            with patch.object(router_mod, "call_openai_chat", side_effect=RuntimeError("quota")) as openai_call:
+                with patch.object(router_mod, "call_gemini_chat", return_value={"provider": "gemini", "model": "gemini-2.0-flash", "content": "fallback ok"}) as gemini_call:
+                    reply = router_mod.call_llm([{"role": "user", "content": "hi"}], json_mode=False, tier="balanced")
+                    self.assertEqual(reply, "fallback ok")
                     self.assertEqual(openai_call.call_count, 1)
-                    self.assertEqual(gemini_call.call_count, 0)
+                    self.assertEqual(gemini_call.call_count, 1)
 
     def test_vendor_notification_failure_is_graceful(self) -> None:
         import app.services.vendor as vendor_mod

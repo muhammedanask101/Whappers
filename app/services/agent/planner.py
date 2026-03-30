@@ -53,7 +53,8 @@ def choose_next_action(
         _log_planner("cheap_action_allowed", intent=analysis.get("intent"), workflow=(state.get("workflow") or {}).get("stage"))
         return _micro_decision(user_message, user, state, analysis)
 
-    if state.get("force_deterministic_fallback") or int(state.get("llm_calls_this_run", 0)) >= 1:
+    llm_budget = _llm_call_budget(state, analysis)
+    if state.get("force_deterministic_fallback") or int(state.get("llm_calls_this_run", 0)) >= llm_budget:
         return decide_action_without_llm(analysis.get("intent", "general"), state.get("workflow") or {}, user_message, state=state, analysis=analysis)
 
     messages = build_planner_messages(
@@ -88,7 +89,23 @@ def choose_next_action(
         plan_steps=list(payload.get("plan_steps") or []),
         goal=dict(payload.get("goal") or {}),
         uncertainty=float(payload.get("uncertainty") or analysis.get("uncertainty") or 0.0),
+        metadata={"provider": payload.get("provider"), "model": payload.get("model")},
     )
+    if _needs_second_pass(decision, analysis, state, scratchpad) and int(state.get("llm_calls_this_run", 0)) < llm_budget:
+        state["llm_calls_this_run"] = int(state.get("llm_calls_this_run", 0)) + 1
+        state["planner_second_pass_used"] = True
+        stronger_payload = call_agent_llm(messages, tier="strong", second_pass=True)
+        decision = PlannerDecision(
+            action=str(stronger_payload.get("action") or "respond").strip() or "respond",
+            arguments=dict(stronger_payload.get("arguments") or {}),
+            message=str(stronger_payload.get("message") or "").strip(),
+            rationale=str(stronger_payload.get("thought") or "").strip() or "second_pass_recovery",
+            confidence=float(stronger_payload.get("confidence") or decision.confidence),
+            plan_steps=list(stronger_payload.get("plan_steps") or decision.plan_steps),
+            goal=dict(stronger_payload.get("goal") or decision.goal),
+            uncertainty=float(stronger_payload.get("uncertainty") or decision.uncertainty),
+            metadata={"provider": stronger_payload.get("provider"), "model": stronger_payload.get("model")},
+        )
     decision = _enforce_workflow_lock(decision, user_message, state, analysis)
     _log_planner("llm_planner_result", action=decision.action, confidence=decision.confidence, rationale=decision.rationale, arguments=decision.arguments)
     return decision
@@ -329,3 +346,32 @@ def _looks_like_catalog_browse(lowered: str) -> bool:
         or "what do you have" in lowered
         or ("products" in lowered and any(term in lowered for term in {"show", "see", "browse"}))
     )
+
+
+def _llm_call_budget(state: Dict[str, Any], analysis: Dict[str, Any]) -> int:
+    if float(analysis.get("uncertainty") or 0.0) >= 0.55:
+        return 2
+    if state.get("last_tool_gap") or (state.get("tool_failures") or {}):
+        return 2
+    return 1
+
+
+def _needs_second_pass(
+    decision: PlannerDecision,
+    analysis: Dict[str, Any],
+    state: Dict[str, Any],
+    scratchpad: List[ToolObservation],
+) -> bool:
+    if not analysis.get("needs_llm"):
+        return False
+    if state.get("planner_second_pass_used"):
+        return False
+    if decision.action == "respond" and float(decision.confidence or 0.0) < 0.45:
+        return True
+    if float(decision.uncertainty or 0.0) >= 0.7:
+        return True
+    if decision.action and int((state.get("tool_failures") or {}).get(decision.action, 0)) > 0:
+        return True
+    if scratchpad and not scratchpad[-1].ok:
+        return True
+    return False

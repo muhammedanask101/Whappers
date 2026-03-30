@@ -3,14 +3,25 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 
-from app.db.mongo import get_collection, parse_datetime
-from app.services.admin import delete_business
-from app.services.agent.observability import get_recent_traces
-from app.services.vendor import create_business, get_business_by_id, list_businesses, update_business, get_product_catalog
-from app.services.intelligence.analytics import get_business_metrics, get_top_products
-from app.services.intelligence.insights import generate_insights
+from app.services.dashboard import (
+    create_business_with_subscription,
+    delete_business_with_context,
+    get_activity_logs,
+    get_business_analytics,
+    get_business_detail_with_context,
+    get_business_list_with_context,
+    get_global_analytics,
+    get_support_tickets,
+    get_usage_summary,
+    query_orders,
+    update_business_with_context,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin-api"])
+
+
+def _log_legacy_admin_usage(route: str) -> None:
+    print(f"[route.admin_api] deprecated_route_used route={route!r}")
 
 
 def _require_admin_token(token: Optional[str]) -> None:
@@ -21,51 +32,26 @@ def _require_admin_token(token: Optional[str]) -> None:
 
 @router.post("/business")
 def create_business_endpoint(payload: Dict[str, Any], x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _log_legacy_admin_usage("/admin/business")
     _require_admin_token(x_admin_token)
     try:
-        return create_business(
-            name=str(payload.get("name") or "").strip(),
-            slug=str(payload.get("slug") or "").strip() or None,
-            whatsapp_number=str(payload.get("whatsapp_number") or "").strip(),
-            vendor_phone=str(payload.get("vendor_phone") or "").strip(),
-            business_type=str(payload.get("business_type") or "retail").strip(),
-            description=str(payload.get("description") or "").strip(),
-            address=str(payload.get("address") or "").strip(),
-            hours=str(payload.get("hours") or "").strip(),
-            contact_phone=str(payload.get("contact_phone") or "").strip(),
-            support_details=str(payload.get("support_details") or "").strip(),
-            policies=str(payload.get("policies") or "").strip(),
-            delivery_info=str(payload.get("delivery_info") or "").strip(),
-        )
+        return create_business_with_subscription(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/businesses")
 def list_businesses_endpoint(x_admin_token: Optional[str] = Header(default=None)) -> List[Dict[str, Any]]:
+    _log_legacy_admin_usage("/admin/businesses")
     _require_admin_token(x_admin_token)
-    return list_businesses()
+    return get_business_list_with_context()
 
 
 @router.put("/business/{business_id}")
 def update_business_endpoint(business_id: str, payload: Dict[str, Any], x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _log_legacy_admin_usage("/admin/business/{business_id}")
     _require_admin_token(x_admin_token)
-    updated = update_business(
-        business_id,
-        name=payload.get("name"),
-        slug=payload.get("slug"),
-        whatsapp_number=payload.get("whatsapp_number"),
-        vendor_phone=payload.get("vendor_phone"),
-        business_type=payload.get("business_type"),
-        description=payload.get("description"),
-        address=payload.get("address"),
-        hours=payload.get("hours"),
-        contact_phone=payload.get("contact_phone"),
-        support_details=payload.get("support_details"),
-        policies=payload.get("policies"),
-        delivery_info=payload.get("delivery_info"),
-        active=payload.get("active"),
-    )
+    updated = update_business_with_context(business_id, payload)
     if not updated:
         raise HTTPException(status_code=404, detail="Business not found.")
     return updated
@@ -73,9 +59,10 @@ def update_business_endpoint(business_id: str, payload: Dict[str, Any], x_admin_
 
 @router.delete("/business/{business_id}")
 def delete_business_endpoint(business_id: str, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _log_legacy_admin_usage("/admin/business/{business_id}")
     _require_admin_token(x_admin_token)
     try:
-        deleted = delete_business(business_id)
+        deleted = delete_business_with_context(business_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not deleted:
@@ -88,22 +75,9 @@ def admin_orders(
     business_id: str = Query(default=""),
     x_admin_token: Optional[str] = Header(default=None),
 ) -> List[Dict[str, Any]]:
+    _log_legacy_admin_usage("/admin/orders")
     _require_admin_token(x_admin_token)
-    query: Dict[str, Any] = {}
-    if business_id:
-        query["business_id"] = business_id
-    rows = get_collection("orders").find(query).sort("created_at", -1).limit(200)
-    return [
-        {
-            "business_id": row.get("business_id"),
-            "order_id": row.get("order_id"),
-            "customer_phone": row.get("customer_phone"),
-            "status": row.get("status"),
-            "total": float(row.get("total", 0)),
-            "created_at": parse_datetime(row.get("created_at")).isoformat() if parse_datetime(row.get("created_at")) else None,
-        }
-        for row in rows
-    ]
+    return query_orders(business_id=business_id)
 
 
 @router.get("/usage")
@@ -111,15 +85,9 @@ def admin_usage(
     business_id: str = Query(default=""),
     x_admin_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
+    _log_legacy_admin_usage("/admin/usage")
     _require_admin_token(x_admin_token)
-    business_query = {"business_id": business_id} if business_id else {}
-    history_query = {"business_id": business_id} if business_id else {}
-    return {
-        "messages": get_collection("chat_history").count_documents(history_query),
-        "orders": get_collection("orders").count_documents(business_query),
-        "support_tickets": get_collection("support_tickets").count_documents(business_query),
-        "customers": len(get_collection("orders").distinct("customer_phone", business_query)),
-    }
+    return get_usage_summary(business_id)
 
 
 @router.get("/support")
@@ -127,36 +95,19 @@ def admin_support(
     business_id: str = Query(default=""),
     x_admin_token: Optional[str] = Header(default=None),
 ) -> List[Dict[str, Any]]:
+    _log_legacy_admin_usage("/admin/support")
     _require_admin_token(x_admin_token)
-    query: Dict[str, Any] = {}
-    if business_id:
-        query["business_id"] = business_id
-    rows = get_collection("support_tickets").find(query).sort("created_at", -1).limit(200)
-    return [
-        {
-            "business_id": row.get("business_id"),
-            "ticket_id": row.get("ticket_id"),
-            "customer_phone": row.get("customer_phone"),
-            "issue": row.get("issue"),
-            "status": row.get("status"),
-            "order_id": row.get("order_id"),
-            "created_at": parse_datetime(row.get("created_at")).isoformat() if parse_datetime(row.get("created_at")) else None,
-        }
-        for row in rows
-    ]
+    return get_support_tickets(business_id)
 
 @router.get("/dashboard/{business_id}")
 def get_dashboard(business_id: str, x_admin_token: Optional[str] = Header(default=None)):
+    _log_legacy_admin_usage("/admin/dashboard/{business_id}")
     _require_admin_token(x_admin_token)
-    metrics = get_business_metrics(business_id)
-    top_products = get_top_products(business_id)
-    insights = generate_insights(business_id)
-
-    return {
-        "metrics": metrics,
-        "top_products": top_products,
-        "insights": insights
-    }
+    business = get_business_detail_with_context(business_id)
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found.")
+    analytics = get_business_analytics(business_id)
+    return {"business": business, **analytics}
 
 
 @router.get("/agent-traces")
@@ -165,20 +116,8 @@ def agent_traces(
     phone: str = Query(default=""),
     x_admin_token: Optional[str] = Header(default=None),
 ) -> List[Dict[str, Any]]:
+    _log_legacy_admin_usage("/admin/agent-traces")
     _require_admin_token(x_admin_token)
     if not business_id:
         raise HTTPException(status_code=400, detail="business_id is required.")
-    rows = get_recent_traces(business_id, phone=phone, limit=40)
-    return [
-        {
-            "phone": row.get("phone"),
-            "role": row.get("role"),
-            "message": row.get("message"),
-            "analysis": row.get("analysis", {}),
-            "strategy": row.get("strategy", {}),
-            "goal_tracking": row.get("goal_tracking", {}),
-            "metrics": row.get("metrics", {}),
-            "created_at": parse_datetime(row.get("created_at")).isoformat() if parse_datetime(row.get("created_at")) else None,
-        }
-        for row in rows
-    ]
+    return get_activity_logs(business_id, phone=phone).get("agent_traces", [])

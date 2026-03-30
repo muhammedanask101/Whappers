@@ -34,6 +34,7 @@ class PlannerDecision:
     plan_steps: List[Dict[str, Any]] = field(default_factory=list)
     goal: Dict[str, Any] = field(default_factory=dict)
     uncertainty: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

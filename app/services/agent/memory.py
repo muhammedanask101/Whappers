@@ -7,6 +7,7 @@ from app.db.mongo import DEFAULT_BUSINESS_ID, get_collection, utc_now
 from app.services.agent.learning import get_learning_profile, recent_events, tokenize
 from app.services.agent.prompts import summarize_memory_payload
 from app.services.agent.semantic_memory import remember, retrieve, summarize_for_prompt
+from app.services.intelligence.insights import generate_insights
 from app.services.intelligence.customer_profile import get_customer_profile
 from app.services.state import append_history, get_conversation_state, get_recent_history, update_last_language
 from app.services.vendor import get_business_profile
@@ -125,6 +126,8 @@ def build_memory_bundle(phone: str, business_id: str, state: Dict[str, Any], sty
     events = recent_events(business_id, phone=phone, limit=8)
     business = get_business_profile(business_id)
     semantic_rows = retrieve(phone, business_id, query=_semantic_query(state, summary, learning), limit=6)
+    automation_rows = list(get_collection("automation_log").find({"business_id": business_id, "phone": phone}).sort("created_at", -1).limit(4))
+    vendor_queue_count = get_collection("vendor_notification_queue").count_documents({"business_id": business_id, "status": "pending"})
     return summarize_memory_payload(
         history=history,
         summary=summary,
@@ -142,6 +145,11 @@ def build_memory_bundle(phone: str, business_id: str, state: Dict[str, Any], sty
             "address": business.get("address"),
         },
         "semantic_context": summarize_for_prompt(semantic_rows),
+        "automation": {
+            "recent_messages": [_serialize_event(row) for row in automation_rows],
+            "pending_vendor_notifications": vendor_queue_count,
+        },
+        "business_insights": generate_insights(business_id)[:3],
         "goal_tracking": state.get("goal_tracking", {}),
         "feedback": state.get("feedback", {}),
         "style": style,

@@ -30,7 +30,8 @@ class Settings:
         self.mongodb_db_name = os.getenv("MONGODB_DB_NAME", "").strip() or "whatsapp_agent"
         self.session_secret = os.getenv("MANAGER_SESSION_SECRET", "").strip() or secrets.token_urlsafe(48)
         self.session_https_only = self.environment in {"prod", "production"}
-        self.session_same_site = "lax"
+        self.session_same_site = os.getenv("SESSION_SAME_SITE", "lax").strip().lower() or "lax"
+        self.session_cookie_domain = os.getenv("SESSION_COOKIE_DOMAIN", "").strip() or None
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.openai_api_url = os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions").strip()
         self.openai_models = {
@@ -38,6 +39,15 @@ class Settings:
             "balanced": os.getenv("OPENAI_BALANCED_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")).strip(),
             "strong": os.getenv("OPENAI_STRONG_MODEL", os.getenv("OPENAI_SMART_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1"))).strip(),
         }
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_api_url = os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta/models").strip()
+        self.gemini_models = {
+            "cheap": os.getenv("GEMINI_CHEAP_MODEL", "gemini-2.0-flash").strip(),
+            "balanced": os.getenv("GEMINI_BALANCED_MODEL", "gemini-2.0-flash").strip(),
+            "strong": os.getenv("GEMINI_STRONG_MODEL", "gemini-2.5-pro").strip(),
+        }
+        provider_priority = os.getenv("LLM_PROVIDER_PRIORITY", "openai,gemini").strip()
+        self.llm_provider_priority = [item.strip().lower() for item in provider_priority.split(",") if item.strip()]
         self.twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
         self.twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
         self.twilio_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER", "").strip()

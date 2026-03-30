@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 from twilio.request_validator import RequestValidator
 
 from app.core.settings import get_settings
+from app.db.mongo import get_collection, utc_now
 from app.services.agent.controller import process_incoming_message
 from app.services.llm import safe_user_facing_text
 from app.services.vendor import get_business_by_vendor_phone, get_business_by_whatsapp_number, normalize_phone, send_whatsapp_message_async
@@ -51,8 +52,20 @@ def _is_duplicate_webhook(message_sid: str, sender: str, body: str) -> bool:
     dedupe_key = message_sid.strip() or f"{sender}|{body.strip().lower()}"
     if dedupe_key in _RECENT_WEBHOOKS:
         return True
-    _RECENT_WEBHOOKS[dedupe_key] = now
-    return False
+    inserted = _reserve_distributed_dedupe_key(dedupe_key)
+    if inserted:
+        _RECENT_WEBHOOKS[dedupe_key] = now
+        return False
+    return True
+
+
+def _reserve_distributed_dedupe_key(dedupe_key: str) -> bool:
+    result = get_collection("webhook_dedupe").update_one(
+        {"key": dedupe_key},
+        {"$setOnInsert": {"key": dedupe_key, "created_at": utc_now()}},
+        upsert=True,
+    )
+    return bool(result.upserted_id)
 
 
 @router.post("/webhook/whatsapp")

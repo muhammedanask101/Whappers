@@ -39,6 +39,17 @@ def get_admin_overview() -> dict[str, Any]:
     }
 
 
+def delete_business_with_context(business_id: str) -> Optional[dict[str, Any]]:
+    business = get_business_by_id(business_id)
+    if not business:
+        return None
+    active_count = get_collection("businesses").count_documents({"active": True})
+    if business.get("active", True) and active_count <= 1:
+        raise ValueError("At least one active business must remain.")
+    updated = update_business(business_id, active=False)
+    return get_business_detail_with_context(business_id) if updated else None
+
+
 def get_business_list_with_context() -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for business in list_businesses():
@@ -131,6 +142,37 @@ def get_global_analytics() -> dict[str, Any]:
         "order_trends": _order_trends(order_rows),
         "top_products": get_global_top_products(),
     }
+
+
+def get_usage_summary(business_id: str = "") -> dict[str, Any]:
+    query = {"business_id": business_id} if business_id else {}
+    history_query = {"business_id": business_id} if business_id else {}
+    return {
+        "messages": get_collection("chat_history").count_documents(history_query),
+        "orders": get_collection("orders").count_documents(query),
+        "support_tickets": get_collection("support_tickets").count_documents(query),
+        "customers": len(get_collection("orders").distinct("customer_phone", query)),
+    }
+
+
+def get_support_tickets(business_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if business_id:
+        query["business_id"] = business_id
+    rows = get_collection("support_tickets").find(query).sort("created_at", -1).limit(min(max(int(limit or 200), 1), 500))
+    return [
+        {
+            "business_id": row.get("business_id"),
+            "ticket_id": row.get("ticket_id"),
+            "customer_phone": row.get("customer_phone"),
+            "issue": row.get("issue"),
+            "status": row.get("status"),
+            "order_id": row.get("order_id"),
+            "created_at": to_iso(parse_datetime(row.get("created_at"))),
+            "updated_at": to_iso(parse_datetime(row.get("updated_at"))),
+        }
+        for row in rows
+    ]
 
 
 def get_global_top_products(limit: int = 10) -> list[dict[str, Any]]:

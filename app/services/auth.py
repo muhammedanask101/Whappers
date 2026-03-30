@@ -273,14 +273,23 @@ def _set_refresh_cookie(response: Response, refresh_token: str) -> None:
         value=refresh_token,
         httponly=True,
         secure=settings.session_https_only,
-        samesite="lax",
+        samesite=settings.session_same_site,
         max_age=REFRESH_TOKEN_DAYS * 24 * 60 * 60,
+        domain=settings.session_cookie_domain,
         path="/",
     )
 
 
 def _clear_refresh_cookie(response: Response) -> None:
-    response.delete_cookie(key=REFRESH_COOKIE_NAME, path="/")
+    settings = get_settings()
+    response.delete_cookie(
+        key=REFRESH_COOKIE_NAME,
+        path="/",
+        domain=settings.session_cookie_domain,
+        secure=settings.session_https_only,
+        httponly=True,
+        samesite=settings.session_same_site,
+    )
 
 
 def issue_auth_tokens(response: Response, user: dict[str, Any]) -> dict[str, Any]:
@@ -354,6 +363,21 @@ def get_current_user(
         if legacy_user:
             return legacy_user
     raise HTTPException(status_code=401, detail="Authentication required.")
+
+
+def get_current_api_user(authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    bearer = str(authorization or "").strip()
+    if not bearer.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    payload = _decode_jwt(bearer.split(" ", 1)[1].strip())
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid access token.")
+    return {
+        "user_id": payload.get("sub"),
+        "email": payload.get("email"),
+        "role": payload.get("role"),
+        "business_id": payload.get("business_id"),
+    }
 
 
 def require_roles(user: dict[str, Any], *roles: str) -> dict[str, Any]:

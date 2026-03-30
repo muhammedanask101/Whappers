@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
+from app.api.contracts import error_response, should_wrap_api_response
 from app.core.settings import get_settings
 from app.db.database import init_db
 from app.db.mongo import get_mongo_database
@@ -53,7 +54,24 @@ app.add_middleware(SlowAPIMiddleware)
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    if should_wrap_api_response(request.url.path):
+        return JSONResponse(status_code=429, content=error_response("Too many requests. Please slow down."))
     return JSONResponse(status_code=429, content={"detail": "Too many requests. Please slow down."})
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if should_wrap_api_response(request.url.path):
+        return JSONResponse(status_code=exc.status_code, content=error_response(str(exc.detail)))
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[app] unhandled_exception path={request.url.path!r} error={exc!r}")
+    if should_wrap_api_response(request.url.path):
+        return JSONResponse(status_code=500, content=error_response("Internal server error."))
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 
 app.include_router(onboarding_router)

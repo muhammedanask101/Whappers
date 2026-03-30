@@ -11,7 +11,7 @@ from app.services.auth import (
     authenticate_credentials,
     authenticate_legacy_admin_token,
     create_user,
-    get_current_user,
+    get_current_api_user,
     issue_auth_tokens,
     refresh_auth_tokens,
     refresh_token_from_cookie,
@@ -46,6 +46,7 @@ def login(payload: LoginRequest, response: Response) -> dict:
     if payload.email and payload.password:
         user = authenticate_credentials(payload.email, payload.password)
     elif payload.admin_token:
+        print("[route.api_auth] deprecated_admin_token_login_used")
         user = authenticate_legacy_admin_token(payload.admin_token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials.")
@@ -66,7 +67,7 @@ def logout(response: Response, refresh_token: Optional[str] = Depends(refresh_to
 
 
 @router.get("/me")
-def me(user: dict = Depends(get_current_user)) -> dict:
+def me(user: dict = Depends(get_current_api_user)) -> dict:
     return success_response(user)
 
 

@@ -9,7 +9,7 @@ from app.services.agent.learning import record_event
 from app.services.agent.metrics import record_metric
 from app.services.agent.localization import contact_style, style_text
 from app.services.intelligence.recommendations import recommend_products
-from app.services.vendor import get_business_profile, send_whatsapp_message_async
+from app.services.vendor import get_business_profile, list_businesses, retry_failed_notifications, send_whatsapp_message_async
 
 
 class AutomationScheduler:
@@ -36,6 +36,7 @@ class AutomationScheduler:
             await asyncio.to_thread(process_orders)
             await asyncio.to_thread(process_support_recovery)
             await asyncio.to_thread(process_campaign_feedback)
+            await asyncio.to_thread(process_notification_retries)
 
     async def _run_loop(self) -> None:
         while not self._stopping.is_set():
@@ -161,6 +162,16 @@ def process_campaign_feedback() -> None:
             upsert=True,
         )
         record_metric(business_id, metric="automation_conversion", amount=1.0 if converted else 0.0, dimensions={"kind": row.get("kind"), "phone": phone})
+
+
+def process_notification_retries() -> None:
+    for business in list_businesses():
+        business_id = str((business or {}).get("business_id") or "")
+        if not business_id:
+            continue
+        retried = retry_failed_notifications(business_id)
+        if retried:
+            record_metric(business_id, metric="automation_retry_success", amount=float(retried), dimensions={"kind": "vendor_notification"})
 
 
 def _safe_send(business_id: str, phone: str, message: str, *, event_kind: str) -> None:

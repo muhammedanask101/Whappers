@@ -163,6 +163,7 @@ async def process_incoming_message(message: str, user: Dict[str, Any]) -> str:
                 "rationale": decision.rationale,
                 "confidence": decision.confidence,
                 "plan_steps": decision.plan_steps,
+                "metadata": decision.metadata,
             }
             for decision in result.decision_trace
         ],
