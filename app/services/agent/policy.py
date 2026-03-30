@@ -8,6 +8,7 @@ from app.services.agent.extraction import (
     message_has_structured_cart_payload,
     message_requires_cart_extraction,
 )
+from app.services.cart_engine import parse_cart_intent, parse_cart_requests
 from app.services.agent.learning import learned_token_weights, rank_token_match, tokenize
 from app.services.agent.tools import vendor_status_candidates
 
@@ -87,7 +88,17 @@ CORRECTION_PHRASES = {
 
 ACKNOWLEDGEMENT_TOKENS = {"yeah", "yes", "ok", "okay", "show", "it", "bill", "fine", "sure", "hmm"}
 CANCEL_PHRASES = {"cancel", "cancel order", "stop order", "never mind", "forget it"}
-ORDER_STATUS_PHRASES = {"my order", "order status", "where is my order", "track order", "track my order", "see my order", "view my order"}
+ORDER_STATUS_PHRASES = {
+    "my order",
+    "order status",
+    "where is my order",
+    "track order",
+    "track my order",
+    "see my order",
+    "view my order",
+    "show my order",
+    "check my order",
+}
 
 
 def analyze_message(
@@ -124,6 +135,10 @@ def analyze_message(
     structured_cart_payload = message_has_structured_cart_payload(message)
     multi_entity_cart = message_has_multi_entity_cart_input(message)
     cart_extraction_required = message_requires_cart_extraction(message)
+    cart_requests = parse_cart_requests(message)
+    cart_operation = parse_cart_intent(message)
+    cart_mutation_request = _has_cart_mutation_request(lowered, cart_requests, cart_operation)
+    order_status_request = _is_order_status_request(lowered, tokens)
     cart_view_request = _is_cart_view_request(lowered)
     explicit_cancel = any(phrase in lowered for phrase in CANCEL_PHRASES)
     if workflow.get("stage") == "collect_address":
@@ -133,22 +148,33 @@ def analyze_message(
     if workflow.get("name") == "order_checkout":
         scores["cart"] += 0.18
         scores["checkout"] += 0.22
+        if cart_mutation_request:
+            scores["cart"] += 0.52
+            scores["checkout"] -= 0.22
+        if order_status_request:
+            scores["order_status"] += 1.1
+            scores["checkout"] -= 0.36
+            scores["cart"] -= 0.28
     if cart_items:
         scores["cart"] += 0.18
         scores["checkout"] += 0.16
         if cart_view_request:
             scores["cart"] += 0.5
             scores["browse"] -= 0.35
+        if cart_mutation_request:
+            scores["cart"] += 0.34
+            scores["checkout"] -= 0.18
     if workflow.get("stage") == "ready_to_checkout" and lowered in {"yes", "ok", "okay", "confirm", "place", "proceed"}:
         scores["checkout"] += 0.8
-    if "new order" in lowered or "make a new order" in lowered or "place an order" in lowered:
+    if "new order" in lowered or "make a new order" in lowered or ("place an order" in lowered and not order_status_request):
         scores["cart"] += 0.55
         scores["browse"] += 0.2
         scores["order_status"] -= 0.2
-    if any(phrase in lowered for phrase in ORDER_STATUS_PHRASES):
-        scores["order_status"] += 0.75
+    if order_status_request:
+        scores["order_status"] += 1.05
         scores["browse"] -= 0.25
         scores["support"] -= 0.1
+        scores["cart"] -= 0.22
     if any(term in lowered for term in {"refund", "replace", "damaged", "issue", "problem", "wrong item", "late order", "missing item"}):
         scores["support"] += 0.48
         scores["browse"] -= 0.18
@@ -162,6 +188,9 @@ def analyze_message(
         scores["general"] -= 0.12
     if multi_entity_cart:
         scores["cart"] += 0.18
+    if cart_mutation_request:
+        scores["cart"] += 0.32
+        scores["general"] -= 0.12
     if "address" in lowered:
         scores["checkout"] += 0.22
     if lowered in {"hi", "hello", "hey", "hey there", "hey theree", "hii"}:
@@ -217,7 +246,9 @@ def analyze_message(
         "cart_extraction_required": cart_extraction_required,
         "cart_view_request": cart_view_request,
         "explicit_cancel": explicit_cancel,
-        "order_workflow_locked": workflow.get("name") == "order_checkout" and not explicit_cancel,
+        "cart_mutation_request": cart_mutation_request,
+        "order_status_request": order_status_request,
+        "order_workflow_locked": workflow.get("name") == "order_checkout" and not explicit_cancel and not cart_mutation_request and not order_status_request,
     }
 
 
@@ -381,6 +412,28 @@ def _is_stretched_greeting(lowered: str) -> bool:
 
 def _is_cart_view_request(lowered: str) -> bool:
     return lowered in {"show my cart", "show cart", "view cart", "my cart", "cart"} or ("cart" in lowered and any(token in lowered for token in {"show", "view", "what", "inside"}))
+
+
+def _has_cart_mutation_request(lowered: str, cart_requests: List[Dict[str, Any]], cart_operation: str) -> bool:
+    if "clear cart" in lowered or lowered == "clear":
+        return True
+    if lowered.startswith("remove") or lowered.startswith("delete"):
+        return True
+    if lowered.startswith("set ") or " set " in lowered:
+        return True
+    if lowered.startswith("add ") or " add " in lowered:
+        return True
+    if any(phrase in lowered for phrase in {"take off", "delete item", "remove item"}):
+        return True
+    return False
+
+
+def _is_order_status_request(lowered: str, tokens: List[str]) -> bool:
+    if any(phrase in lowered for phrase in ORDER_STATUS_PHRASES):
+        return True
+    if "order" in tokens and any(token in tokens for token in {"show", "see", "view", "track", "status", "where", "check"}):
+        return True
+    return False
 
 
 def _looks_like_browse_request(lowered: str, tokens: List[str]) -> bool:

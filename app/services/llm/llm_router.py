@@ -63,7 +63,12 @@ def call_llm(
     temperature: float = 0.2,
     tier: str = "balanced",
 ) -> str:
-    result = _route_chat(messages, json_mode=json_mode, temperature=temperature, tier=tier)
+    try:
+        result = _route_chat(messages, json_mode=json_mode, temperature=temperature, tier=tier)
+    except Exception as exc:
+        _log_llm("raw_router_failed", tier=tier, error=str(exc))
+        fallback = _deterministic_raw_fallback(json_mode=json_mode)
+        return fallback
     return result.get("content", "")
 
 
@@ -137,3 +142,10 @@ def _deterministic_planner_fallback() -> Dict[str, Any]:
         "provider": "deterministic",
         "model": "fallback",
     }
+
+
+def _deterministic_raw_fallback(*, json_mode: bool) -> str:
+    _LAST_ROUTE_STATUS.update({"provider": "deterministic", "model": "fallback", "fallback_used": True})
+    if json_mode:
+        return json.dumps({"message": "Please tell me a bit more so I can help properly."})
+    return "Please tell me a bit more so I can help properly."

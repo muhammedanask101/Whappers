@@ -1,0 +1,14 @@
+[vendor] send_whatsapp_message_start to='whatsapp:+919847241611' from_number='whatsapp:+14155238886' body_preview='Your order ORD-5ED311CF is being prepared.' debug_mode=False
+[vendor] external_api_request provider='twilio' to='whatsapp:+919847241611' from_number='whatsapp:+14155238886' body_chars=42
+[vendor] external_api_response provider='twilio' sid='SMd58065c11039de046ab86a12197cd73c' status='queued' to='whatsapp:+919847241611'
+INFO:     127.0.0.1:62440 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/business/me HTTP/1.1" 401 Unauthorized
+INFO:     127.0.0.1:62440 - "POST /api/auth/signup HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/auth/me HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/business/me HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/onboarding/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/subscription/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/business/catalog HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "GET /api/business/performance HTTP/1.1" 402 Payment Required
+INFO:     127.0.0.1:62440 - "POST /api/auth/refresh HTTP/1.1" 200 OK
+INFO:     127.0.0.1:62440 - "POST /api/auth/logout HTTP/1.1" 200 OK

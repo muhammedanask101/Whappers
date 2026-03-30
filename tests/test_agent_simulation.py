@@ -167,6 +167,34 @@ class AgentSimulationTests(unittest.TestCase):
         analysis = analyze_message("show my order", user={"role": "customer"}, state={"workflow": {}}, learning_profile={})
         self.assertEqual(analysis["intent"], "order_status")
 
+    def test_show_my_order_interrupts_checkout_with_order_status_intent(self) -> None:
+        analysis = analyze_message(
+            "show my order",
+            user={"role": "customer"},
+            state={
+                "workflow": {"name": "order_checkout", "stage": "ready_to_checkout"},
+                "cart": {"items": [{"name": "tea", "qty": 2}], "address": "K T House"},
+            },
+            learning_profile={},
+        )
+        self.assertEqual(analysis["intent"], "order_status")
+        self.assertTrue(analysis["order_status_request"])
+        self.assertFalse(analysis["order_workflow_locked"])
+
+    def test_remove_item_during_checkout_stays_cart_intent(self) -> None:
+        analysis = analyze_message(
+            "remove coffee",
+            user={"role": "customer"},
+            state={
+                "workflow": {"name": "order_checkout", "stage": "ready_to_checkout"},
+                "cart": {"items": [{"name": "tea", "qty": 2}, {"name": "coffee", "qty": 1}], "address": "K T House"},
+            },
+            learning_profile={},
+        )
+        self.assertEqual(analysis["intent"], "cart")
+        self.assertTrue(analysis["cart_mutation_request"])
+        self.assertFalse(analysis["order_workflow_locked"])
+
     def test_confirm_routes_to_checkout_order_in_ready_state(self) -> None:
         action = route_by_intent("checkout", "confirm", {"workflow": {"stage": "ready_to_checkout"}, "cart": {}, "analysis": {}})
         self.assertEqual(action, "checkout_order")
@@ -986,6 +1014,15 @@ class AgentSimulationTests(unittest.TestCase):
                     self.assertEqual(reply, "fallback ok")
                     self.assertEqual(openai_call.call_count, 1)
                     self.assertEqual(gemini_call.call_count, 1)
+
+    def test_raw_llm_returns_deterministic_fallback_when_all_providers_fail(self) -> None:
+        import app.services.llm.llm_router as router_mod
+        from app.core.settings import get_settings
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "", "GEMINI_API_KEY": "", "ENV": "dev"}, clear=False):
+            get_settings.cache_clear()
+            reply = router_mod.call_llm([{"role": "user", "content": "hi"}], json_mode=False, tier="balanced")
+            self.assertIn("tell me a bit more", reply.lower())
 
     def test_vendor_notification_failure_is_graceful(self) -> None:
         import app.services.vendor as vendor_mod
